@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Nick's AniSong Ranker</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="brand">Nick's <b>AniSong</b> Ranker</div>
+    <button class="nav active" id="navSearch"><span class="name">&#128269;&nbsp; Search songs</span></button>
+    <button class="nav" id="navStats"><span class="name">&#128202;&nbsp; Stats</span></button>
+    <div class="label">Playlists</div>
+    <input type="search" id="plFilter" placeholder="Search playlists…" aria-label="Search playlists">
+    <div id="plList"></div>
+    <div class="side-actions">
+      <button class="btn wide" id="newPl">+ New playlist</button>
+      <button class="btn wide" id="combinePl">&#10753; Combine playlists</button>
+      <button class="btn wide" id="importPl">&#8679; Import</button>
+      <input type="file" id="importFile" accept=".json,.csv,.tsv,.txt,.xlsx,.xlsm" hidden>
+    </div>
+  </aside>
+
+  <main>
+    <section id="viewSearch">
+      <h2 class="head">Find songs</h2>
+      <form class="card" id="searchForm">
+        <div class="searchline">
+          <div class="qwrap">
+            <input type="text" id="q" placeholder="Anime, song, artist or composer" aria-label="Search" autocomplete="off">
+            <div id="suggest" hidden></div>
+          </div>
+          <button class="btn primary big" type="submit" id="searchBtn">&#128269; Search</button>
+          <button class="btn big" type="button" id="resetBtn">&#10005; Reset</button>
+        </div>
+        <div class="filters">
+          <div class="field"><div class="label">Search in</div>
+            <div class="seg" id="segField">
+              <button type="button" data-v="all" class="on">Everything</button><button type="button" data-v="anime">Anime</button>
+              <button type="button" data-v="song">Song name</button><button type="button" data-v="artist">Artist</button>
+              <button type="button" data-v="composer">Composer</button>
+            </div></div>
+          <div class="field"><div class="label">Season</div>
+            <div class="seg" id="segSeason">
+              <button type="button" data-v="" class="on">Any</button><button type="button" data-v="Winter">Winter</button>
+              <button type="button" data-v="Spring">Spring</button><button type="button" data-v="Summer">Summer</button>
+              <button type="button" data-v="Fall">Fall</button>
+            </div></div>
+          <div class="field"><label class="label" for="year">Year</label>
+            <input type="number" id="year" placeholder="e.g. 2024" min="1950" max="2100" style="width:120px"></div>
+          <div class="field"><div class="label">Song type</div>
+            <div class="chips" id="types">
+              <button type="button" class="chip on" data-v="OP">Openings</button>
+              <button type="button" class="chip on" data-v="ED">Endings</button>
+              <button type="button" class="chip on" data-v="IN">Insert songs</button>
+            </div></div>
+          <div class="field"><label class="label" for="animeType">Format</label>
+            <select id="animeType"><option value="">Any format</option><option>TV</option><option>Movie</option>
+              <option>OVA</option><option>ONA</option><option>Special</option></select></div>
+          <div class="field"><div class="label">Options</div>
+            <div class="row" style="height:40px;gap:16px">
+              <label class="chk"><input type="checkbox" id="exact"> Exact match</label>
+              <label class="chk"><input type="checkbox" id="dub"> Dubs</label>
+              <label class="chk"><input type="checkbox" id="rebroadcast"> Rebroadcasts</label>
+            </div></div>
+        </div>
+        <div class="newseason row">
+          <button class="btn" type="button" id="freshBtn">&#10024; Load newest season</button>
+          <span class="sub" id="freshHint"></span>
+        </div>
+        <div class="facets" id="sFacets" hidden></div>
+      </form>
+
+      <div class="row toolbar">
+        <span class="status" id="searchStatus"></span>
+        <span class="grow"></span>
+        <label class="chk sub"><input type="checkbox" id="hideRated"> Hide rated</label>
+        <button class="btn" id="addSel">+ Add selected</button>
+        <button class="btn primary" id="addAll">+ Add all shown</button>
+      </div>
+      <div class="tablewrap"><table><thead id="sHead"></thead><tbody id="sRows"></tbody></table></div>
+    </section>
+
+    <section id="viewPlaylist" hidden>
+      <div class="row head">
+        <h2 id="plName"></h2>
+        <span class="grow"></span>
+        <button class="btn sm" id="plPin"></button>
+        <button class="btn sm" id="plCombine">&#10753; Combine</button>
+        <button class="btn sm" id="plRename">Rename</button>
+        <button class="btn sm danger" id="plDelete">Delete</button>
+      </div>
+      <div class="card">
+        <div class="stats" id="plStats"></div>
+        <div class="row">
+          <button class="btn primary" id="plPlay">&#9654; Play all</button>
+          <button class="btn" id="plRate">&#9733; Rate mode</button>
+          <button class="btn" id="addCustom">+ Custom song</button>
+          <button class="btn" id="plMatch" hidden>&#8635; Match new-season songs</button>
+          <button class="btn" id="plExport">&#8679; Share ▾</button>
+          <span class="grow"></span>
+          <select id="dlFormat" aria-label="Download format"></select>
+          <button class="btn" id="dlAll">&#8681; Download all</button>
+        </div>
+        <div class="status" id="dlStatus" style="margin-top:10px" hidden></div>
+        <div class="facets" id="pFacets"></div>
+      </div>
+      <div class="sub" id="plCount" style="margin:-6px 0 10px"></div>
+      <div class="tablewrap"><table><thead id="pHead"></thead><tbody id="pRows"></tbody></table></div>
+    </section>
+
+    <section id="viewImport" hidden>
+      <div class="row head"><h2>Import your ratings</h2></div>
+      <div class="card" id="impStart">
+        <div class="row">
+          <button class="btn primary" id="impPick">&#8679; Choose a file</button>
+          <span class="sub">CSV or Excel, or a playlist file from a friend. For Google Sheets: File → Download → CSV, or just copy the cells and paste them below.</span>
+        </div>
+        <label class="label" for="impPaste" style="display:block;margin-top:18px">Or paste rows</label>
+        <textarea id="impPaste" rows="5" placeholder="Select the cells in Google Sheets or Excel, copy, and paste here"></textarea>
+        <div class="row" style="margin-top:10px"><button class="btn" id="impPasteGo">Use these rows</button></div>
+      </div>
+
+      <div class="card" id="impMap" hidden>
+        <div class="filters">
+          <div class="field" id="impSheetField"><label class="label" for="impSheet">Sheet</label><select id="impSheet"></select></div>
+          <div class="field"><label class="label" for="impYear">Year</label>
+            <input type="number" id="impYear" placeholder="e.g. 2025" min="1950" max="2100" style="width:110px"></div>
+          <div class="field"><label class="label" for="impOutOf">Scores are out of</label>
+            <select id="impOutOf"><option>10</option><option>5</option><option>100</option></select></div>
+          <div class="field"><label class="label" for="impType">Songs in this sheet</label>
+            <select id="impType"><option value="">Any</option><option value="OP">Openings</option><option value="ED">Endings</option><option value="IN">Insert songs</option></select></div>
+          <div class="field"><div class="label">&nbsp;</div><label class="chk" style="height:40px"><input type="checkbox" id="impHeader"> First row is headings</label></div>
+        </div>
+        <div class="sub" style="margin:16px 0 10px">Check what each column is. Season rows like "Winter" are picked up on their own, and the year is used to look songs up faster.</div>
+        <div class="tablewrap"><table id="impPreview"></table></div>
+        <div class="row" style="margin-top:14px">
+          <button class="btn primary" id="impMatch">&#128269; Find these songs</button>
+          <span class="sub" id="impCount"></span>
+          <span class="grow"></span>
+          <button class="btn" id="impRestart">Start over</button>
+        </div>
+      </div>
+
+      <div id="impReview" hidden>
+        <div class="card">
+          <div class="stats" id="impStats"></div>
+          <div class="row">
+            <div class="seg" id="impFilter">
+              <button type="button" data-v="all" class="on">All</button><button type="button" data-v="likely">Double-check</button>
+              <button type="button" data-v="none">Not found</button><button type="button" data-v="unchecked">Couldn't check</button>
+            </div>
+            <span class="grow"></span>
+            <select id="impInto" aria-label="Import into"></select>
+            <input type="text" id="impName" placeholder="Playlist name" maxlength="120" style="width:230px">
+            <button class="btn primary" id="impGo">&#8679; Import</button>
+            <button class="btn" id="impRestart2">Start over</button>
+          </div>
+          <div class="status" id="impNote" style="margin-top:10px"></div>
+        </div>
+        <div class="tablewrap"><table><thead><tr><th><input type="checkbox" class="chkbox" id="impAll" aria-label="Tick all shown" checked></th>
+          <th>Row</th><th>In your sheet</th><th>Score</th><th>Found in AniSongDB</th></tr></thead><tbody id="impRows"></tbody></table></div>
+      </div>
+    </section>
+
+    <section id="viewStats" hidden>
+      <div class="row head">
+        <h2>Stats</h2>
+        <span class="grow"></span>
+        <select id="statsScope" aria-label="Which playlists"></select>
+      </div>
+      <div class="stats" id="statTiles"></div>
+      <div class="sgrid" id="statCards"></div>
+    </section>
+  </main>
+</div>
+
+<dialog id="customDlg">
+  <form id="customForm" method="dialog">
+    <h3>Add a custom song</h3>
+    <div class="sub">For anything that isn't in the database.</div>
+    <div class="field"><label class="label" for="cName">Song name</label><input type="text" id="cName" required maxlength="300"></div>
+    <div class="field"><label class="label" for="cArtist">Artist</label><input type="text" id="cArtist" maxlength="300"></div>
+    <div class="field"><label class="label" for="cAnime">Anime</label><input type="text" id="cAnime" maxlength="300"></div>
+    <div class="field"><label class="label" for="cLink">Link</label><input type="text" id="cLink" placeholder="https://…" maxlength="500"></div>
+    <div class="field"><label class="label" for="cScore">Score /10</label><input type="number" id="cScore" min="0" max="10" step="0.5" style="width:110px"></div>
+    <div class="status err" id="cErr" style="margin-top:10px"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:18px">
+      <button class="btn" type="button" data-close>Cancel</button>
+      <button class="btn primary" type="submit">Add</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="combineDlg">
+  <form id="combineForm" method="dialog">
+    <h3>Combine playlists</h3>
+    <div class="sub">Songs are copied over with their scores and notes. The originals stay as they are.</div>
+    <div class="field"><div class="label">Take songs from</div><div class="picklist" id="combineFrom"></div></div>
+    <div class="field"><label class="label" for="combineInto">Put them in</label>
+      <select id="combineInto"></select></div>
+    <div class="field" id="combineNameField"><label class="label" for="combineName">New playlist name</label>
+      <input type="text" id="combineName" maxlength="120"></div>
+    <div class="status err" id="combineErr" style="margin-top:10px"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:18px">
+      <button class="btn" type="button" data-close>Cancel</button>
+      <button class="btn primary" type="submit">Combine</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="findDlg">
+  <h3>Find the right song</h3>
+  <div class="sub" id="findFor"></div>
+  <form id="findForm" class="findbar">
+    <input type="search" id="findQ" aria-label="Search for" autocomplete="off">
+    <div class="seg" id="findField">
+      <button type="button" data-v="song" class="on">Song</button><button type="button" data-v="anime">Anime</button><button type="button" data-v="artist">Artist</button>
+    </div>
+    <button class="btn primary" type="submit">Search</button>
+  </form>
+  <div class="status" id="findNote"></div>
+  <div id="findResults"></div>
+  <div class="row" style="justify-content:flex-end;margin-top:16px">
+    <button class="btn" type="button" id="findCustom">Keep it as a custom song</button>
+    <button class="btn" type="button" data-close>Cancel</button>
+  </div>
+</dialog>
+
+<dialog id="rateDlg">
+  <div id="rateBody"></div>
+</dialog>
+
+<dialog id="imageDlg">
+  <h3>Top 10</h3>
+  <img id="imagePreview" alt="Top 10 image">
+  <div class="row" style="justify-content:flex-end">
+    <button class="btn" type="button" data-close>Close</button>
+    <button class="btn primary" type="button" id="imageSave">&#8681; Save image</button>
+  </div>
+</dialog>
+
+<div id="menu" hidden></div>
+<div id="busy" hidden>
+  <div class="busybox">
+    <div class="spinner"></div>
+    <h3 id="busyTitle">Loading…</h3>
+    <div class="sub" id="busyStep"></div>
+    <div class="busybar"><i id="busyBar"></i></div>
+    <div class="sub" id="busyHint" style="margin-top:12px"></div>
+    <button class="btn sm" id="busyCancel" style="margin-top:16px">Cancel</button>
+  </div>
+</div>
+<div id="videoBox" hidden>
+  <div class="vbar"><span class="sub" id="videoTitle"></span><span class="grow"></span>
+    <button class="ib" id="videoBig" title="Bigger / smaller" aria-label="Resize video"><svg viewBox="0 0 24 24"><path d="M4 4h6v2H6v4H4zm10 0h6v6h-2V6h-4zM4 14h2v4h4v2H4zm14 0h2v6h-6v-2h4z"/></svg></button>
+    <button class="ib" id="videoClose" title="Back to audio only" aria-label="Close video"><svg viewBox="0 0 24 24"><path d="m6 4.6 6 6 6-6 1.4 1.4-6 6 6 6-1.4 1.4-6-6-6 6L4.6 18l6-6-6-6z"/></svg></button>
+  </div>
+  <video id="audio" preload="none" playsinline></video>
+  <div class="vnone" id="videoNone">No video for this one</div>
+</div>
+<div id="tip" hidden></div>
+
+<div class="player">
+  <div class="np">
+    <div class="cover none" id="npCover"></div>
+    <div class="info"><div class="title" id="npSong">Nothing playing</div><div class="sub" id="npSub"></div></div>
+  </div>
+  <div class="pc">
+    <div class="ctl">
+      <button class="ib" id="prev" aria-label="Previous"><svg viewBox="0 0 24 24"><path d="M6 5h2v14H6zm3 7 10 7V5z"/></svg></button>
+      <button class="ib" id="playBtn" aria-label="Play"></button>
+      <button class="ib" id="next" aria-label="Next"><svg viewBox="0 0 24 24"><path d="M16 5h2v14h-2zM5 5v14l10-7z"/></svg></button>
+    </div>
+    <div class="seekrow"><span id="tCur">0:00</span>
+      <input type="range" id="seek" min="0" max="1000" value="0" aria-label="Seek"><span id="tDur">0:00</span></div>
+  </div>
+  <div class="vol">
+    <button class="ib" id="videoBtn" title="Show the video" aria-label="Show video"><svg viewBox="0 0 24 24"><path d="M3 6h13v12H3zm14 4 4-3v10l-4-3z"/></svg></button>
+    <button class="ib" id="mute" aria-label="Mute"><svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9zm11.5 3a4 4 0 0 0-2-3.5v7a4 4 0 0 0 2-3.5z"/></svg></button>
+    <input type="range" id="vol" min="0" max="100" value="100" aria-label="Volume">
+  </div>
+</div>
+<div id="toast" role="status"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
