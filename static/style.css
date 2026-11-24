@@ -234,7 +234,16 @@ input[type=range]::-moz-range-thumb { width: 13px; height: 13px; border-radius: 
 #menu .plpick button { display: flex; justify-content: space-between; gap: 14px; }
 #menu .plpick small { display: inline; }
 #menu .menuhead { color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; padding: 4px 12px 8px; }
-.picklist { display: grid; gap: 4px; max-height: 240px; overflow-y: auto; background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; }
+.picklist { display: grid; gap: 2px; max-height: 280px; overflow-y: auto; background: var(--panel2); border: 1px solid var(--line);
+            border-radius: 10px; padding: 6px; }
+.pickitem { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto auto; align-items: center; gap: 10px;
+            padding: 8px 10px; border-radius: 8px; cursor: pointer; }
+.pickitem:hover { background: var(--panel3); }
+.pickitem:has(input:checked) { background: rgba(47,122,245,.14); }
+.pickitem .pname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pickitem .pcount { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 40px; text-align: right; }
+#combineDlg { width: min(520px, 94vw); }
+#combineSearch { width: 100%; }
 #combineDlg select { width: 100%; }
 
 /* loading overlay */
@@ -288,6 +297,29 @@ textarea { width: 100%; background: var(--panel2); border: 1px solid var(--line)
 #findResults .cover { width: 34px; height: 48px; border-radius: 5px; }
 #findResults .t { font-weight: 600; }
 
+/* rate mode with a real player */
+#rateDlg { width: min(1100px, 95vw); }
+.rate2 { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(260px, 1fr); gap: 26px; align-items: start; }
+.rmedia { display: grid; gap: 10px; }
+.rvideo { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 12px; display: block; }
+.rart { width: 100%; aspect-ratio: 16 / 9; border-radius: 12px; background: var(--panel3) center/contain no-repeat; position: relative; }
+.rart.none::after { content: "♪"; position: absolute; inset: 0; display: grid; place-items: center; font-size: 54px; color: #4d5566; }
+.raudio { width: 100%; }
+.rside h3 { font-size: 24px; margin: 6px 0 4px; line-height: 1.2; }
+.rside .who { font-size: 16px; color: #c9d3e6; }
+.rside .rnote { width: 100%; margin-top: 8px; }
+.rside .foot { display: flex; align-items: center; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+
+/* playlist selection, friend playlists, All songs */
+.selbar { position: sticky; top: 8px; z-index: 5; display: flex; align-items: center; gap: 10px; background: var(--panel2);
+          border: 1px solid var(--accent); border-radius: 12px; padding: 8px 12px; margin-bottom: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+tr.picked td { background: rgba(47,122,245,.08); }
+.tag.FRIEND { color: var(--violet); background: rgba(201,160,255,.13); font-size: 10.5px; padding: 1px 7px; }
+.theirs { display: inline-block; min-width: 46px; text-align: center; font-weight: 800; background: var(--panel3); border-radius: 8px; padding: 6px 8px; }
+.theirnote { color: #c9d3e6; font-style: italic; font-size: 12.5px; margin-top: 4px; }
+.allrow .nav { font-weight: 600; }
+.allrow { margin-bottom: 8px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+
 /* video */
 #videoBox { position: fixed; right: 22px; bottom: 100px; z-index: 25; width: 440px; background: #000; border: 1px solid #3a4560;
             border-radius: 14px; overflow: hidden; box-shadow: 0 18px 50px rgba(0,0,0,.6); }
@@ -306,7 +338,7 @@ textarea { width: 100%; background: var(--panel2); border: 1px solid var(--line)
   main { padding: 18px; }
   .vol { display: none; }
   .player { grid-template-columns: minmax(0,1fr) minmax(200px,1.4fr); }
-  .rate { grid-template-columns: 1fr; }
+  .rate, .rate2 { grid-template-columns: 1fr; }
   .rate .art { width: 160px; height: 225px; }
   .sgrid { grid-template-columns: 1fr; }
 }

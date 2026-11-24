@@ -93,6 +93,7 @@
         <button class="btn sm" id="plRename">Rename</button>
         <button class="btn sm danger" id="plDelete">Delete</button>
       </div>
+      <div class="sub" id="plKind" style="margin:-10px 0 14px"></div>
       <div class="card">
         <div class="stats" id="plStats"></div>
         <div class="row">
@@ -109,6 +110,13 @@
         <div class="facets" id="pFacets"></div>
       </div>
       <div class="sub" id="plCount" style="margin:-6px 0 10px"></div>
+      <div class="selbar" id="plSelBar" hidden>
+        <b id="plSelCount"></b>
+        <button class="btn sm" id="plSelCopy">&#10753; Copy to…</button>
+        <button class="btn sm danger" id="plSelRemove">&#10005; Remove</button>
+        <span class="grow"></span>
+        <button class="btn sm" id="plSelClear">Clear selection</button>
+      </div>
       <div class="tablewrap"><table><thead id="pHead"></thead><tbody id="pRows"></tbody></table></div>
     </section>
 
@@ -117,8 +125,15 @@
       <div class="card" id="impStart">
         <div class="row">
           <button class="btn primary" id="impPick">&#8679; Choose a file</button>
-          <span class="sub">CSV or Excel, or a playlist file from a friend. For Google Sheets: File → Download → CSV, or just copy the cells and paste them below.</span>
+          <span class="sub">CSV or Excel, or a playlist file a friend sent you.</span>
         </div>
+        <label class="label" for="impLink" style="display:block;margin-top:18px">Or a Google Sheets link</label>
+        <div class="row">
+          <input type="text" id="impLink" class="grow" placeholder="https://docs.google.com/spreadsheets/d/…" autocomplete="off">
+          <button class="btn" id="impLinkGo">Open</button>
+        </div>
+        <div class="sub" style="margin-top:6px">The sheet has to be shared as "Anyone with the link". Every tab comes in, and you pick one.</div>
+        <div class="status" id="impLinkNote" style="margin-top:6px"></div>
         <label class="label" for="impPaste" style="display:block;margin-top:18px">Or paste rows</label>
         <textarea id="impPaste" rows="5" placeholder="Select the cells in Google Sheets or Excel, copy, and paste here"></textarea>
         <div class="row" style="margin-top:10px"><button class="btn" id="impPasteGo">Use these rows</button></div>
@@ -198,8 +213,11 @@
 <dialog id="combineDlg">
   <form id="combineForm" method="dialog">
     <h3>Combine playlists</h3>
-    <div class="sub">Songs are copied over with their scores and notes. The originals stay as they are.</div>
-    <div class="field"><div class="label">Take songs from</div><div class="picklist" id="combineFrom"></div></div>
+    <div class="sub">Songs are copied into one playlist. The originals stay as they are, and your scores are the same everywhere anyway.</div>
+    <div class="field"><div class="row" style="margin-bottom:7px"><div class="label" style="margin:0">Take songs from</div>
+      <span class="grow"></span><span class="sub" id="combinePicked"></span><button class="btn sm" type="button" id="combineAll">Select all</button></div>
+      <input type="search" id="combineSearch" placeholder="Find a playlist…" style="margin-bottom:8px">
+      <div class="picklist" id="combineFrom"></div></div>
     <div class="field"><label class="label" for="combineInto">Put them in</label>
       <select id="combineInto"></select></div>
     <div class="field" id="combineNameField"><label class="label" for="combineName">New playlist name</label>

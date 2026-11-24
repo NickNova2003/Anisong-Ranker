@@ -7,13 +7,15 @@ from sources import parse_theme_line, similar, simplify, type_code
 
 ROLES = ("ignore", "anime", "song", "artist", "songartist", "score", "season", "type")
 HEADER_WORDS = {
-    "anime": ("anime", "show", "series"),
-    "song": ("song", "track", "opening", "ending", "theme", "op", "ed"),
-    "artist": ("artist", "singer", "performer", "band", "by"),
+    "anime": ("anime", "show", "series", "anime name", "show name"),
+    "song": ("song", "track", "song name", "title", "song title", "opening", "ending", "theme"),
+    "artist": ("artist", "singer", "performer", "band", "artists", "by"),
     "score": ("score", "rating", "rate", "points", "grade", "mark", "/10", "out of"),
-    "season": ("season", "cour"),
-    "type": ("type", "kind"),
+    "season": ("season", "cour", "vintage"),
+    "type": ("type", "kind", "op/ed", "op / ed"),
 }
+# "Grand Blue Ending 4", "Naruto OP3", "Kingdom ED 7", "Op.2", "Opening Theme 2", "#4"
+SLOT = re.compile(r"(?:^|\s|\b)(op|ed|opening|ending|insert(?: song)?)(?:\s*theme)?\s*[#.]?\s*(\d+)?\s*$", re.I)
 SEASON_WORDS = {"winter": "Winter", "spring": "Spring", "summer": "Summer", "fall": "Fall", "autumn": "Fall"}
 SEASON_ROW = re.compile(r"^\s*(winter|spring|summer|fall|autumn)\b[\s,\-]*((?:19|20)\d\d)?\s*$", re.I)
 
@@ -61,14 +63,27 @@ def read_text(text):
         return []
     sample = text[:5000]
     # pasted from google sheets / excel is tab separated
-    delim = "\t" if sample.count("\t") >= sample.count("\n") * 0.5 and "\t" in sample else None
-    if not delim:
-        try:
-            delim = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
-        except csv.Error:
-            delim = ","
+    if "\t" in sample and sample.count("\t") >= sample.count("\n") * 0.5:
+        # a plain paste keeps "Song" by Artist as typed; only treat quotes as CSV quoting when
+        # the cells really were escaped ("""Song"" by Artist")
+        escaped = looks_escaped(sample)
+        reader = csv.reader(io.StringIO(text), delimiter="\t", quoting=csv.QUOTE_MINIMAL if escaped else csv.QUOTE_NONE)
+        return trim([[c.strip() for c in row] for row in reader])
+    try:
+        delim = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+    except csv.Error:
+        delim = ","
     rows = [[c.strip() for c in row] for row in csv.reader(io.StringIO(text), delimiter=delim)]
     return trim(rows)
+
+
+def looks_escaped(sample):
+    # Google Sheets wraps cells that contain quotes: '"""Song"" by X"'. A plain paste is just '"Song" by X'.
+    quoted = [c for line in sample.split("\n") for c in line.split("\t") if c.startswith('"')]
+    if not quoted:
+        return False
+    wrapped = sum(1 for c in quoted if re.fullmatch(r'"(?:[^"]|"")*"', c))
+    return wrapped >= len(quoted) * 0.8
 
 
 def trim(rows):
@@ -107,11 +122,9 @@ def guess(rows, filename=""):
 
     if header:
         for i, cell in enumerate(rows[0]):
-            low = cell.strip().lower()
-            for role, words in HEADER_WORDS.items():
-                if role not in roles and any(re.search(r"(?<![a-z])" + re.escape(w) + r"(?![a-z])", low) for w in words):
-                    roles[i] = role
-                    break
+            role = header_role(cell)
+            if role and role not in roles:
+                roles[i] = role
 
     def column(i):
         return [r[i] for r in body if i < len(r) and r[i].strip()]
@@ -166,12 +179,25 @@ def guess(rows, filename=""):
     return {"header": header, "roles": roles, "year": year, "outOf": out_of, "type": kind}
 
 
+def header_role(cell):
+    """'Anime Name' -> anime, 'Score /10' -> score. Only short cells count, so 'Grand Blue ED1' isn't a heading."""
+    low = re.sub(r"\s+", " ", cell.strip().lower())
+    if not low or len(low) > 30 or '"' in low or SLOT.search(low) and SLOT.search(low).group(2):
+        return None
+    for role, words in HEADER_WORDS.items():
+        for w in words:
+            if low == w or (len(w) > 2 and re.search(r"(?<![a-z])" + re.escape(w) + r"(?![a-z])", low)):
+                return role
+    return None
+
+
 def looks_like_header(row):
-    cells = [c.strip().lower() for c in row if c.strip()]
+    cells = [c.strip() for c in row if c.strip()]
     if not cells or any(number(c) is not None for c in cells):
         return False
-    return any(any(re.search(r"(?<![a-z])" + re.escape(w) + r"(?![a-z])", c) for ws in HEADER_WORDS.values() for w in ws)
-               for c in cells) or (len(cells) >= 2 and all(len(c) <= 20 for c in cells))
+    if any(parse_theme_line(c) or len(c) > 30 for c in cells):  # a real song row, not headings
+        return False
+    return any(header_role(c) for c in cells)
 
 
 # -------------------------------------------------------------- turning rows into items
@@ -183,16 +209,38 @@ def split_song(cell):
         return parsed[1], parsed[2]
     m = re.match(r"^(.+?)\s+by\s+(.+)$", cell, re.I)
     if m:
-        return m.group(1).strip(' "“”'), m.group(2).strip()
-    return cell.strip(' "“”'), ""
+        return unquote(m.group(1)), m.group(2).strip()
+    return unquote(cell), ""
+
+
+def unquote(text):
+    """Takes off one pair of wrapping quotes, so 'Don't say "lazy"' keeps its own."""
+    text = text.strip()
+    if len(text) >= 2 and text[0] in '"“' and text[-1] in '"”':
+        text = text[1:-1].strip()
+    return text
+
+
+def drop_tags(name):
+    return re.sub(r"\s*\((?:\d+(?:/\d+)*|v\d+|rebroadcast|movie|tv)\)", "", name, flags=re.I).strip()
+
+
+def find_slot(name):
+    """('ED', 4) for 'Grand Blue Ending 4', ('OP', 1) for 'Naruto OP', None if it doesn't say."""
+    m = SLOT.search(drop_tags(name))
+    if not m:
+        return None
+    word = m.group(1).lower()
+    code = "OP" if word.startswith("op") else "ED" if word.startswith(("ed", "end")) else "IN"
+    return code, int(m.group(2) or 1)
 
 
 def clean_anime(name):
-    """Drops the bits people add to tell entries apart: '(2)', '(59/72)', 'EP 8 OP', '(Rebroadcast)'."""
+    """Drops the bits people add to tell entries apart: '(2)', '(59/72)', 'EP 8 OP', 'Ending 4', '(Rebroadcast)'."""
+    name = drop_tags(name)
     name = re.sub(r"\s+EP\s*\d+.*$", "", name, flags=re.I)
-    name = re.sub(r"\s+(OP|ED)\s*\d*\s*$", "", name, flags=re.I)
-    name = re.sub(r"\s*\((?:\d+(?:/\d+)*|v\d+|rebroadcast|movie|tv)\)", "", name, flags=re.I)
-    return re.sub(r"\s+", " ", name).strip()
+    name = SLOT.sub("", name)
+    return re.sub(r"\s+", " ", name).strip(" -:")
 
 
 def build_items(rows, mapping):
@@ -212,9 +260,10 @@ def build_items(rows, mapping):
         anime = get("anime")
         if "songartist" in col:
             song, artist = split_song(get("songartist"))
+        elif "artist" in col:  # artist has its own column, so leave titles like "Stand by Me" alone
+            song, artist = unquote(get("song")), get("artist")
         else:
             song, artist = split_song(get("song")) if get("song") else ("", "")
-            artist = get("artist") or artist
         raw = number(get("score")) if get("score") else None
         score = None
         if raw is not None and 0 <= raw <= out_of:
@@ -225,10 +274,8 @@ def build_items(rows, mapping):
             if s:
                 row_season = f"{s[0]} {s[1] or year}" if (s[1] or year) else ""
         kind = mapping.get("type") or ""
-        slot = None
-        m = re.search(r"\b(OP|ED)\s*(\d+)?\s*$", anime, re.I)  # "Naruto OP3"
-        if m:
-            slot = (m.group(1).upper(), int(m.group(2) or 1))
+        slot = find_slot(anime)  # "Naruto OP3", "Grand Blue Ending 4", "Gintama ED1 (Rebroadcast)"
+        if slot:
             kind = kind or slot[0]
         t = get("type").lower()
         if t:
@@ -260,28 +307,33 @@ def slot_of(song):
     return code, int(m.group(1)) if m else 1
 
 
-def best_match(item, candidates):
-    best, best_score, best_parts = None, 0, None
-    anime = clean_anime(item["anime"])
+def _scored(item, candidates, min_title=0.0):
+    """(candidate, title, anime, artist, same type, same slot) for every song worth a look.
+    A row's OP/ED/Insert label is only a hint: lists often call everything an OP, or AniSongDB files a
+    theme as an insert song, so a different type just has to be backed by a near-exact title."""
+    anime = item.get("animeClean") or clean_anime(item.get("anime") or "")
     for c in candidates:
-        if item["type"] and type_code(c["songType"]) != item["type"]:
-            continue
         t = title_sim(item["song"], c["songName"])
-        if t < 0.4:
+        if t < min_title:
             continue
+        kind = not item.get("type") or type_code(c["songType"]) == item["type"]
         n = max(similar(anime, c["anime"]), similar(anime, c.get("animeJP"))) if anime else 0
-        a = similar(item["artist"], c["artist"]) if item["artist"] else 0
+        a = similar(item["artist"], c["artist"]) if item.get("artist") else 0
+        slot = bool(item.get("slot")) and tuple(item["slot"]) == slot_of(c)
+        yield c, t, n, a, kind, slot
+
+
+def best_match(item, candidates):
+    best, best_score, sure = None, 0, False
+    for c, t, n, a, kind, slot in _scored(item, candidates, 0.4):
         # same anime, same OP/ED number and the same artist is good evidence even if the title is spelt differently
-        same_slot = item.get("slot") and tuple(item["slot"]) == slot_of(c) and n >= 0.8 and a >= 0.7
-        if not ((t >= 0.85 and (n >= 0.6 or a >= 0.6)) or (t >= 0.6 and n >= 0.8 and a >= 0.7) or same_slot):
+        ok = (t >= 0.85 and max(n, a) >= 0.6) or (t >= 0.6 and n >= 0.8 and a >= 0.7) or (slot and n >= 0.8 and a >= 0.7)
+        if not ok or (not kind and t < 0.95):
             continue
-        total = 2 * t + n + a
+        total = 2 * t + n + a + 0.3 * kind
         if total > best_score:
-            best, best_score, best_parts = c, total, (t, n, a)
-    if not best:
-        return None, None
-    t, n, a = best_parts
-    return best, ("sure" if t >= 0.95 and (n >= 0.8 or a >= 0.8) else "likely")
+            best, best_score, sure = c, total, kind and t >= 0.95 and max(n, a) >= 0.8
+    return (best, "sure" if sure else "likely") if best else (None, None)
 
 
 SEASON_ORDER = ["Winter", "Spring", "Summer", "Fall"]
@@ -298,3 +350,31 @@ def nearby_seasons(label, back=3):
         j = i - k
         out.append(f"{SEASON_ORDER[j % 4]} {year + j // 4}")
     return out
+
+
+def auto_pick(item, candidates):
+    """Looser than best_match, for the Auto-pick button: the closest song wins as long as it's
+    plausibly the same one. These get marked so they're easy to look over."""
+    best, best_score = None, 0
+    for c, t, n, a, kind, slot in _scored(item, candidates):
+        if not (t >= 0.75 or (t >= 0.5 and max(n, a) >= 0.6) or (slot and n >= 0.8 and a >= 0.5)):
+            continue
+        if not kind and t < 0.85:
+            continue
+        total = 3 * t + n + a + 0.5 * slot + 0.5 * kind
+        if total > best_score:
+            best, best_score = c, total
+    return best
+
+
+GOOGLE = re.compile(r"^https?://docs\.google\.com/spreadsheets/d/(e/)?([A-Za-z0-9_-]{20,})")
+
+
+def google_export_url(link):
+    """A normal or 'published to the web' Google Sheets link -> its download-as-Excel address (all tabs)."""
+    m = GOOGLE.match((link or "").strip())
+    if not m:
+        return None
+    if m.group(1):
+        return f"https://docs.google.com/spreadsheets/d/e/{m.group(2)}/pub?output=xlsx"
+    return f"https://docs.google.com/spreadsheets/d/{m.group(2)}/export?format=xlsx"

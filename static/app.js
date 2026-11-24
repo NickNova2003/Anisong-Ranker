@@ -5,11 +5,15 @@ const SEASON_NUM = {Winter: 0, Spring: 1, Summer: 2, Fall: 3};
 const view = (id, sort) => ({id, list: [], shown: [], sort, genres: new Set(), theme: "", text: "", selected: new Set()});
 const S = view("s", {key: "anime", dir: 1});   // search results
 const P = view("p", {key: "rank", dir: 1});    // open playlist
+P.kind = "own";
+const ALL_ID = 0;
+const isFriend = () => P.kind === "friend", isAll = () => P.kind === "all";
+const mineOf = s => isFriend() ? s.mine : s.score;  // your own score for a row
 const state = {playlists: [], current: null, library: {}, ffmpeg: false, season: "", year: 0, queue: [], qi: -1, busy: false,
                loadedSeason: "", video: false, focusKey: null};
 
 async function api(path, opts = {}) {
-  if (opts.body) { opts.body = JSON.stringify(opts.body); opts.headers = {"Content-Type": "application/json"}; }
+  if (opts.body && !(opts.body instanceof FormData)) { opts.body = JSON.stringify(opts.body); opts.headers = {"Content-Type": "application/json"}; }
   let r;
   try { r = await fetch(path, opts); } catch (e) { throw new Error("Can't reach the app - is it still running?"); }
   const data = await r.json().catch(() => ({}));
@@ -55,10 +59,10 @@ document.querySelectorAll("dialog [data-close]").forEach(b => b.onclick = () => 
 /* ---------- lists: filter, sort, render bits ---------- */
 const SORTS = {
   song: s => s.songName.toLowerCase(), artist: s => s.artist.toLowerCase(), anime: s => s.anime.toLowerCase(),
-  season: s => seasonNum(s.vintage), length: s => s.length || 0, added: s => s.added || 0,
+  season: s => seasonNum(s.vintage), length: s => s.length || 0, added: s => s.added || 0, mine: s => s.mine ?? -1,
   type: s => "OPEDINCU".indexOf(typeCode(s.songType)) * 100 + (parseInt(s.songType.replace(/\D/g, "")) || 0),
 };
-function rated(s) { return (state.library[s.key] || []).some(x => x.score != null); }
+function rated(s) { return state.library[s.key]?.score != null; }
 function visible(v) {
   const txt = v.text.trim().toLowerCase();
   const list = v.list.filter(s =>
@@ -124,9 +128,9 @@ function typeTags(s) {
 }
 function haveBadge(s) {
   const lib = state.library[s.key]; if (!lib) return "";
-  const best = lib.find(x => x.score != null) || lib[0];
-  const tip = lib.map(x => `${x.name}: ${fmtScore(x.score)}`).join("\n");
-  return `<span class="have ${best.score == null ? "unrated" : ""}" title="${esc(tip)}">${best.score == null ? "In" : "★ " + fmtScore(best.score) + " ·"} ${esc(best.name)}${lib.length > 1 ? ` +${lib.length - 1}` : ""}</span>`;
+  const lists = lib.in || [], tip = (lib.score != null ? `Your score: ${fmtScore(lib.score)}\n` : "") + (lists.length ? "In: " + lists.join(", ") : "Not in a playlist");
+  const where = lists.length ? `${esc(lists[0])}${lists.length > 1 ? ` +${lists.length - 1}` : ""}` : "rated";
+  return `<span class="have ${lib.score == null ? "unrated" : ""}" title="${esc(tip)}">${lib.score == null ? "In" : "★ " + fmtScore(lib.score) + " ·"} ${where}</span>`;
 }
 const songCells = s => `
     <td>${pill("anime", s.anime, s.annId)}<div class="genres">${esc((s.genres || []).slice(0, 4).join(" · "))}</div></td>
@@ -189,21 +193,25 @@ async function loadPlaylists() {
   const cur = state.playlists.find(p => p.id === state.current);
   if (cur) $("plPin").innerHTML = cur.pinned ? "&#128204; Unpin" : "&#128204; Pin";
   const scope = $("statsScope").value;
-  $("statsScope").innerHTML = `<option value="">All playlists</option>` + state.playlists.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  $("statsScope").innerHTML = `<option value="">All songs</option>` + ownLists().map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
   if ([...$("statsScope").options].some(o => o.value === scope)) $("statsScope").value = scope;
 }
+const ownLists = () => state.playlists.filter(p => p.kind === "own");
 async function loadLibrary() {
   try { state.library = await api("/api/library"); } catch (e) {}
 }
 function renderPlList() {
   const f = $("plFilter").value.trim().toLowerCase();
   const list = state.playlists.filter(p => !f || p.name.toLowerCase().includes(f));
-  $("plFilter").hidden = state.playlists.length < 2;
-  $("plList").innerHTML = list.map(p => `
-    <div class="plrow"><button class="nav ${state.current === p.id ? "active" : ""}" data-pl="${p.id}">
-      <span class="name">${esc(p.name)}</span><small title="${p.rated} of ${p.count} rated">${p.average == null ? p.count + " songs" : "avg " + fmtScore(p.average)}</small></button>
-      <button class="pin ${p.pinned ? "on" : ""}" data-pin="${p.id}" title="${p.pinned ? "Unpin" : "Pin to top"}" aria-label="Pin ${esc(p.name)}">&#128204;</button></div>`).join("")
-    || `<div class="sub" style="margin:0 12px">${state.playlists.length ? "No matches." : "No playlists yet."}</div>`;
+  $("plFilter").hidden = state.playlists.length < 4;
+  const avg = p => `<small title="${p.rated} of ${p.count} rated">${p.average == null ? p.count + " songs" : "avg " + fmtScore(p.average)}</small>`;
+  $("plList").innerHTML = list.map(p => p.kind === "all"
+    ? `<div class="plrow allrow"><button class="nav ${state.current === p.id ? "active" : ""}" data-pl="${p.id}">
+         <span class="name">&#9733;&nbsp; ${esc(p.name)}</span>${avg(p)}</button></div>`
+    : `<div class="plrow"><button class="nav ${state.current === p.id ? "active" : ""}" data-pl="${p.id}">
+         <span class="name">${p.kind === "friend" ? `<span class="tag FRIEND">friend</span> ` : ""}${esc(p.name)}</span>${avg(p)}</button>
+       <button class="pin ${p.pinned ? "on" : ""}" data-pin="${p.id}" title="${p.pinned ? "Unpin" : "Pin to top"}" aria-label="Pin ${esc(p.name)}">&#128204;</button></div>`).join("")
+    || `<div class="sub" style="margin:0 12px">No matches.</div>`;
 }
 $("plFilter").addEventListener("input", renderPlList);
 async function newPlaylist(suggest = "") {
@@ -237,7 +245,7 @@ $("importFile").onchange = async e => {
   const file = e.target.files[0]; e.target.value = ""; if (!file) return;
   if (/\.json$/i.test(file.name)) return importPlaylistFile(file);
   const form = new FormData(); form.append("file", file);
-  readSheet(fetch("/api/sheet/read", {method: "POST", body: form}));
+  readSheet(form);
 };
 async function importPlaylistFile(file) {
   let body;
@@ -255,21 +263,32 @@ const ROLE_NAMES = {ignore: "Ignore", anime: "Anime", song: "Song name", artist:
 function resetImport() {
   IMP.rows = null; IMP.items = [];
   $("impStart").hidden = false; $("impMap").hidden = true; $("impReview").hidden = true; $("impPaste").value = "";
+  $("impLinkNote").textContent = "";
 }
 $("impRestart").onclick = resetImport;
 $("impRestart2").onclick = resetImport;
+$("impLinkGo").onclick = () => {
+  const url = $("impLink").value.trim();
+  if (!url) return toast("Paste a Google Sheets link first.");
+  readSheet({url}, "Opening the sheet…");
+};
+$("impLink").addEventListener("keydown", e => { if (e.key === "Enter") $("impLinkGo").click(); });
 $("impPasteGo").onclick = () => {
   const text = $("impPaste").value;
   if (!text.trim()) return toast("Paste some rows first.");
-  readSheet(fetch("/api/sheet/read", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({text, name: "Pasted rows"})}));
+  readSheet({text, name: "Pasted rows"});
 };
-async function readSheet(request) {
+async function readSheet(body, waiting) {  // body: an uploaded file (FormData), {url} or {text}
   show("import");
   let d;
+  if (waiting) { $("impLinkGo").disabled = true; $("impLinkNote").className = "status"; $("impLinkNote").textContent = waiting; }
   try {
-    const r = await request; d = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(d.error || "Couldn't read that.");
-  } catch (err) { return toast(err.message.includes("fetch") ? "Can't reach the app - is it still running?" : err.message); }
+    d = await api("/api/sheet/read", {method: "POST", body});
+    $("impLinkNote").textContent = "";
+  } catch (err) {
+    if (waiting) { $("impLinkNote").className = "status err"; $("impLinkNote").textContent = err.message; } else toast(err.message);
+    return;
+  } finally { $("impLinkGo").disabled = false; }
   IMP.name = d.name; IMP.sheets = d.sheets; IMP.sheet = 0;
   $("impSheet").innerHTML = d.sheets.map((sh, i) => `<option value="${i}">${esc(sh.name)} (${sh.rows.length} rows)</option>`).join("");
   $("impSheetField").hidden = d.sheets.length < 2;
@@ -311,18 +330,18 @@ $("impMatch").onclick = async () => {
   if (!j) return;
   IMP.items = j.items.map(it => ({...it, on: it.status === "found" || it.status === "notfound"}));
   IMP.paused = j.paused; IMP.filter = "all"; setSeg("impFilter", "all");
-  $("impInto").innerHTML = `<option value="">New playlist</option>` + state.playlists.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  $("impInto").innerHTML = `<option value="">New playlist</option>` + ownLists().map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
   $("impName").value = IMP.name; $("impName").hidden = false;
   $("impMap").hidden = true; $("impReview").hidden = false;
   drawReview();
 };
 $("impFilter").addEventListener("click", e => { const b = e.target.closest("button"); if (b) { IMP.filter = b.dataset.v; drawReview(); } });
 $("impInto").onchange = () => { $("impName").hidden = !!$("impInto").value; };
-const inFilter = it => IMP.filter === "all" || (IMP.filter === "likely" ? it.status === "found" && it.confidence === "likely"
+const inFilter = it => IMP.filter === "all" || (IMP.filter === "likely" ? it.status === "found" && (it.confidence === "likely" || it.confidence === "auto")
   : IMP.filter === "none" ? it.status === "notfound" : it.status === "unchecked");
 function drawReview() {
   const all = IMP.items, count = st => all.filter(it => it.status === st).length;
-  const found = count("found"), unsure = all.filter(it => it.status === "found" && it.confidence === "likely").length;
+  const found = count("found"), unsure = all.filter(it => it.status === "found" && (it.confidence === "likely" || it.confidence === "auto")).length;
   const missing = count("notfound"), unchecked = count("unchecked"), blank = count("blank");
   $("impStats").innerHTML = [["Rows", all.length], ["Found", found, true], ["Double-check", unsure], ["Not found", missing],
     ["Couldn't check", unchecked], ["Rated", all.filter(it => it.score != null).length]]
@@ -330,7 +349,9 @@ function drawReview() {
     .map(([l, v, hi]) => `<div class="stat ${hi ? "hi" : ""}"><b>${v}</b><span>${l}</span></div>`).join("");
   let note = "";
   if (unchecked) note += `<b>${unchecked} row${unchecked === 1 ? "" : "s"} couldn't be checked</b> - ${IMP.paused ? "AniSongDB turns off its song search during AMQ ranked games" : "AniSongDB didn't answer in time"}. They're left out for now. <button class="btn sm" id="impRetry">&#8635; Try these again</button> `;
-  if (missing) note += `Songs that weren't found come in as custom songs with your score - use <b>Find</b> to pick the real one. `;
+  const auto = `<button class="btn sm" id="impAuto">&#10024; Auto-pick ${missing + unchecked}</button>`;
+  if (missing) note += `Songs that weren't found come in as custom songs with your score - use <b>Find</b> to pick the real one, or ${auto} to take the closest match for each. `;
+  else if (unchecked) note += `Or ${auto} to take the closest match for each. `;
   if (blank) note += `${blank} row${blank === 1 ? " has" : "s have"} no song name and will be skipped.`;
   $("impNote").innerHTML = note;
   const list = all.filter(inFilter);
@@ -342,7 +363,8 @@ function drawReview() {
     const find = it.song ? `<button class="btn sm" data-find="${i}">&#128269; ${m ? "Change" : "Find"}</button>` : "";
     let ours;
     if (m) {
-      const tag = it.confidence === "picked" ? `<span class="tag PICKED">picked</span>` : it.confidence === "likely" ? `<span class="tag LIKELY" title="Close but not exact - worth a look">check</span>` : "";
+      const tag = it.confidence === "picked" ? `<span class="tag PICKED">picked</span>` : it.confidence === "auto" ? `<span class="tag LIKELY" title="Auto-picked - the closest match, worth a look">auto</span>`
+        : it.confidence === "likely" ? `<span class="tag LIKELY" title="Close but not exact - worth a look">check</span>` : "";
       ours = `<div class="found"><div class="cover ${m.coverSmall ? "" : "none"}" ${m.coverSmall ? `style="background-image:url('${esc(m.coverSmall)}')"` : ""}></div>
         <div><div class="title">${esc(m.songName)} ${tag}</div>
         <div class="sub">${esc(m.artist)} · ${esc(m.anime)} · ${esc(shortType(m.songType))} · ${esc(m.vintage)}</div>
@@ -372,11 +394,11 @@ $("impAll").onchange = e => {
   IMP.items.filter(it => it.song && inFilter(it)).forEach(it => it.on = on);
   drawReview();
 };
-async function runMatch(body, title) {
+async function runMatch(body, title, path = "/api/sheet/match", payload = null) {
   setBusy(true); overlay(true, title, "Each song gets checked against AniSongDB, so big sheets take a minute or two.");
   const job = busyJob = {cancelled: false};
   try {
-    job.id = (await api("/api/sheet/match", {method: "POST", body})).job;
+    job.id = (await api(path, {method: "POST", body: payload || body})).job;
     const j = await poll(job.id, j => {
       if (job.cancelled) throw new Error("cancelled");
       $("busyStep").textContent = j.step + (j.total ? ` (${j.done} of ${j.total})` : "");
@@ -389,6 +411,7 @@ async function runMatch(body, title) {
   finally { if (busyJob === job) { busyJob = null; overlay(false); setBusy(false); } }
 }
 $("impNote").addEventListener("click", async e => {
+  if (e.target.closest("#impAuto")) return autoPick();
   if (!e.target.closest("#impRetry")) return;
   const retry = IMP.items.filter(it => it.status === "unchecked");
   const j = await runMatch({items: retry.map(({match, confidence, status, on, checked, before, ...rest}) => rest)}, `Trying ${retry.length} rows again`);
@@ -403,6 +426,25 @@ $("impNote").addEventListener("click", async e => {
   toast(still ? `${retry.length - still} sorted, ${still} still couldn't be checked.` : "All checked.");
   drawReview();
 });
+
+async function autoPick() {
+  const open = it => it.status === "notfound" || it.status === "unchecked";
+  const rows = IMP.items.filter(open);
+  const j = await runMatch({}, `Auto-picking ${rows.length} songs`, "/api/sheet/autopick",
+    {items: rows.map(({match, confidence, status, on, checked, before, ...rest}) => rest)});
+  if (!j) return;
+  const byRow = new Map(j.items.filter(x => x.match).map(x => [x.row, x.match]));
+  IMP.items.forEach(it => {
+    if (open(it) && byRow.has(it.row)) {
+      it.before = {match: null, confidence: null, status: it.status};
+      Object.assign(it, {match: byRow.get(it.row), confidence: "auto", status: "found", on: true});
+    }
+  });
+  const left = IMP.items.filter(open).length;
+  toast(`Picked ${byRow.size} - they're tagged "auto" so you can check them.` + (left ? ` ${left} had nothing close.` : "")
+    + (j.paused ? " AniSongDB's song search was paused for AMQ ranked, so try again later for better picks." : ""));
+  drawReview();
+}
 
 /* picking the right song by hand */
 let findIdx = null, findList = [];
@@ -491,7 +533,8 @@ $("impGo").onclick = async () => {
   const into = $("impInto").value;
   try {
     const d = await api("/api/sheet/import", {method: "POST", body: {items, into: into || null, name: $("impName").value}});
-    toast(`Imported ${d.added} song${d.added === 1 ? "" : "s"} into "${d.name}"` + (d.duplicates ? ` · ${d.duplicates} were already there` : ""));
+    toast(`Imported ${d.added} song${d.added === 1 ? "" : "s"} into "${d.name}"` + (d.duplicates ? ` · ${d.duplicates} were already there` : "")
+      + (d.kept ? ` · kept your own score for ${d.kept} you'd already rated` : ""));
     resetImport(); await loadLibrary(); openPlaylist(d.id);
   } catch (err) { toast(err.message); }
 };
@@ -684,19 +727,19 @@ function pickPlaylist(btn, songs) {
   if (!songs.length) return toast("Nothing to add - tick some songs first.");
   const draw = filter => {
     const f = filter.trim().toLowerCase();
-    return state.playlists.filter(p => !f || p.name.toLowerCase().includes(f)).map(p =>
+    return ownLists().filter(p => !f || p.name.toLowerCase().includes(f)).map(p =>
       `<button type="button" data-addto="${p.id}"><span>${p.pinned ? "&#128204; " : ""}${esc(p.name)}</span><small>${p.count} songs</small></button>`).join("")
       || `<div>No playlist called that.</div>`;
   };
   showMenu(btn, `<div class="menuhead">Add ${songs.length} song${songs.length === 1 ? "" : "s"} to…</div>
-    ${state.playlists.length > 5 ? `<input type="search" id="pickFilter" placeholder="Find a playlist…">` : ""}
+    ${ownLists().length > 5 ? `<input type="search" id="pickFilter" placeholder="Find a playlist…">` : ""}
     <div class="plpick">${draw("")}</div>
     <button type="button" data-addto="new"><b>+ New playlist…</b></button>`, true);
   $("pickFilter")?.focus();
   $("pickFilter")?.addEventListener("input", e => { $("menu").querySelector(".plpick").innerHTML = draw(e.target.value); });
   pendingAdd = songs;
 }
-let pendingAdd = [];
+let pendingAdd = [], pendingAfter = null;
 document.addEventListener("click", async e => {
   const b = e.target.closest("[data-addto]"); if (!b) return;
   const songs = pendingAdd; pendingAdd = [];
@@ -709,9 +752,11 @@ document.addEventListener("click", async e => {
   try {
     const d = await api(`/api/playlists/${pid}/songs`, {method: "POST", body: {songs}});
     toast(`Added ${d.added} to "${name}"` + (d.skipped ? ` · ${d.skipped} were already there` : "")
-      + (d.carried ? ` · ${d.carried} kept their score from another playlist` : ""));
-    S.selected.clear();
-    await Promise.all([loadPlaylists(), loadLibrary()]); renderSearch();
+      + (d.carried ? ` · ${d.carried} already rated` : ""));
+    if (pendingAfter) pendingAfter(); else S.selected.clear();
+    pendingAfter = null;
+    await Promise.all([loadPlaylists(), loadLibrary()]);
+    if (!$("viewPlaylist").hidden) refreshPlaylist(); else renderSearch();
   } catch (err) { toast(err.message); }
 });
 $("addSel").onclick = e => { e.stopPropagation(); pickPlaylist($("addSel"), S.list.filter(s => S.selected.has(s.key))); };
@@ -723,9 +768,16 @@ async function openPlaylist(id, keepFilters) {
   try { d = await api("/api/playlists/" + id); } catch (e) { toast(e.message); return loadPlaylists(); }
   const same = keepFilters && state.current === id;
   state.current = id;
-  P.list = d.songs;
-  if (!same) { P.genres.clear(); P.theme = ""; P.text = ""; P.sort = {key: "rank", dir: 1}; $("dlStatus").hidden = true; }
+  P.list = d.songs; P.kind = d.kind;
+  if (!same) { P.genres.clear(); P.theme = ""; P.text = ""; P.sort = {key: "rank", dir: 1}; P.selected.clear(); $("dlStatus").hidden = true; }
+  const keys = new Set(P.list.map(s => s.key));
+  [...P.selected].forEach(k => keys.has(k) || P.selected.delete(k));
   $("plName").textContent = d.name;
+  $("plKind").innerHTML = d.kind === "all" ? "Every song in your playlists, plus anything you've rated. It fills itself in."
+    : d.kind === "friend" ? "A friend's playlist: their scores and notes, with yours alongside. Rating here only changes your score." : "";
+  // what you can do depends on the kind of list
+  ["plPin", "plRename", "plDelete"].forEach(b => $(b).hidden = d.kind === "all");
+  $("addCustom").hidden = d.kind !== "own";
   if ($("viewPlaylist").hidden) show("playlist");
   state.current = id;
   await loadPlaylists(); facets(P); renderPlaylist();
@@ -733,23 +785,27 @@ async function openPlaylist(id, keepFilters) {
 const refreshPlaylist = () => openPlaylist(state.current, true);
 function renderPlaylist() {
   const list = visible(P); menuList = list; P.shown = list;
+  const friend = isFriend(), all = isAll();
   const order = P.list.filter(s => s.score != null).sort(byRank);
   const rankOf = new Map(order.map((s, i) => [s.key, i + 1]));
-  const avg = avgOf(order);
+  const avg = avgOf(order), mine = P.list.filter(s => s.mine != null);
   $("plStats").innerHTML = `
-    <div class="stat hi"><b>${avg == null ? "–" : avg.toFixed(2)}</b><span>Average</span></div>
+    <div class="stat hi"><b>${avg == null ? "–" : avg.toFixed(2)}</b><span>${friend ? "Their average" : "Average"}</span></div>
+    ${friend ? `<div class="stat"><b>${mine.length ? (mine.reduce((t, s) => t + s.mine, 0) / mine.length).toFixed(2) : "–"}</b><span>Your average</span></div>` : ""}
     <div class="stat"><b>${P.list.length}</b><span>Songs</span></div>
-    <div class="stat"><b>${order.length}</b><span>Rated</span></div>
+    <div class="stat"><b>${friend ? mine.length : order.length}</b><span>${friend ? "You've rated" : "Rated"}</span></div>
     <div class="stat"><b>${order.length ? fmtScore(order[0].score) : "–"}</b><span>Highest</span></div>
     <div class="stat"><b>${order.length ? fmtScore(order[order.length - 1].score) : "–"}</b><span>Lowest</span></div>`;
   const shownRated = list.filter(s => s.score != null);
   $("plCount").textContent = list.length !== P.list.length
     ? `Showing ${list.length} of ${P.list.length}` + (shownRated.length ? ` · average of these ${avgOf(shownRated).toFixed(2)}` : "") : "";
   $("plMatch").hidden = !P.list.some(isNew);
-  $("plRate").textContent = `★ Rate mode${P.list.length - order.length ? ` (${P.list.length - order.length} left)` : ""}`;
-  const canNudge = P.sort.key === "rank" && P.sort.dir === 1;
-  head(P, [["Rank", "rank"], [""], ["Song", "song"], ["Artist", "artist"], ["Anime", "anime"], ["Season", "season"],
-           ["Type", "type"], ["Score", "score"], [""]]);
+  const left = P.list.filter(s => mineOf(s) == null).length;
+  $("plRate").textContent = `★ Rate mode${left ? ` (${left} left)` : ""}`;
+  const canNudge = !friend && P.sort.key === "rank" && P.sort.dir === 1;
+  head(P, [[`<input type="checkbox" class="chkbox" id="pSelAll" aria-label="Select all shown">`], ["Rank", "rank"], [""], ["Song", "song"],
+           ["Artist", "artist"], ["Anime", "anime"], ["Season", "season"], ["Type", "type"],
+           ...(friend ? [["Theirs", "score"], ["Yours", "mine"]] : [["Score", "score"]]), [""]]);
   $("pRows").innerHTML = list.map((s, i) => {
     const r = rankOf.get(s.key);
     let tie = "";
@@ -758,17 +814,23 @@ function renderPlaylist() {
       if (up || down) tie = `<span class="tie"><button data-move="-1" data-key="${esc(s.key)}" ${up ? "" : "disabled"} title="Move above the song with the same score">▲</button><button data-move="1" data-key="${esc(s.key)}" ${down ? "" : "disabled"} title="Move below">▼</button></span>`;
     }
     const link = s.custom && /^https?:\/\//i.test(s.link || "") ? `<a class="btn sm" href="${esc(s.link)}" target="_blank" rel="noopener noreferrer">Open &#8599;</a>` : "";
+    const box = v => `<input type="number" class="score" min="0" max="10" step="any" value="${v ?? ""}" placeholder="–" data-score="${esc(s.key)}" aria-label="Your score">`;
+    const note = friend ? (s.note ? `<div class="theirnote">“${esc(s.note)}”</div>` : "")
+      : `<input class="note" data-note="${esc(s.key)}" value="${esc(s.note)}" placeholder="Add a note" maxlength="500" aria-label="Note">`;
     return `
-    <tr data-key="${esc(s.key)}">
+    <tr data-key="${esc(s.key)}" class="${P.selected.has(s.key) ? "picked" : ""}">
+      <td><input type="checkbox" class="chkbox psel" data-key="${esc(s.key)}" ${P.selected.has(s.key) ? "checked" : ""} aria-label="Select"></td>
       <td class="rank ${r && r <= 3 ? "top" : ""}">${r ? "#" + r : "–"}${tie}</td>
       <td>${coverCell(s, i)}</td>
-      <td><div class="title">${esc(s.songName)}</div>
-          <input class="note" data-note="${esc(s.key)}" value="${esc(s.note)}" placeholder="Add a note" maxlength="500" aria-label="Note"></td>
+      <td><div class="title">${esc(s.songName)}</div>${note}</td>
       <td>${artistPills(s)}</td>${songCells(s)}
-      <td><input type="number" class="score" min="0" max="10" step="any" value="${s.score ?? ""}" placeholder="–" data-score="${esc(s.key)}" aria-label="Score"></td>
+      ${friend ? `<td><span class="theirs">${s.score == null ? "–" : fmtScore(s.score)}</span></td><td>${box(s.mine)}</td>` : `<td>${box(s.score)}</td>`}
       <td><div class="actions">${s.custom ? link : srcOf(s) ? `<button class="btn sm" data-dl="${i}">&#8681; ▾</button>` : ""}
-          <button class="btn sm danger" data-remove="${esc(s.key)}" title="Remove from playlist">&#10005;</button></div></td>
-    </tr>`; }).join("") || `<tr><td colspan="9" class="empty">${P.list.length ? "Nothing matches those filters." : "Empty - add songs from Search."}</td></tr>`;
+          ${all ? "" : `<button class="btn sm danger" data-remove="${esc(s.key)}" title="Remove from playlist">&#10005;</button>`}</div></td>
+    </tr>`; }).join("") || `<tr><td colspan="${friend ? 11 : 10}" class="empty">${P.list.length ? "Nothing matches those filters."
+      : all ? "Nothing yet - songs show up here once they're in a playlist or rated." : "Empty - add songs from Search."}</td></tr>`;
+  $("pSelAll").checked = list.length > 0 && list.every(s => P.selected.has(s.key));
+  drawSelBar();
   markPlaying();
   if (state.focusKey) {
     const box = [...$("pRows").querySelectorAll(".score")].find(b => b.dataset.score === state.focusKey);
@@ -776,16 +838,30 @@ function renderPlaylist() {
     if (box) { box.focus(); box.select(); }
   }
 }
+function drawSelBar() {
+  const n = P.selected.size;
+  $("plSelBar").hidden = !n;
+  if (!n) return;
+  $("plSelCount").textContent = `${n} selected`;
+  $("plSelRemove").hidden = isAll();
+}
 async function saveScore(key, value) {
   await api(`/api/playlists/${state.current}/songs/${encodeURIComponent(key)}`, {method: "PATCH", body: {score: value}});
+  const v = value === "" || value == null ? null : Math.round(+value * 100) / 100;
   const s = P.list.find(x => x.key === key);
-  if (s) s.score = value === "" || value == null ? null : Math.round(+value * 100) / 100;
+  if (s) { s.mine = v; if (!isFriend()) s.score = v; }
 }
 $("pRows").addEventListener("change", async e => {
   const key = e.target.dataset.score, nkey = e.target.dataset.note;
+  if (e.target.matches(".psel")) {
+    e.target.checked ? P.selected.add(e.target.dataset.key) : P.selected.delete(e.target.dataset.key);
+    e.target.closest("tr").classList.toggle("picked", e.target.checked);
+    $("pSelAll").checked = P.shown.length > 0 && P.shown.every(s => P.selected.has(s.key));
+    return drawSelBar();
+  }
   if (key) {
     try { await saveScore(key, e.target.value); renderPlaylist(); loadPlaylists(); loadLibrary(); }
-    catch (err) { state.focusKey = null; toast(err.message); e.target.value = P.list.find(x => x.key === key)?.score ?? ""; }
+    catch (err) { state.focusKey = null; toast(err.message); const s = P.list.find(x => x.key === key); e.target.value = s ? mineOf(s) ?? "" : ""; }
   }
   if (nkey) {
     try {
@@ -794,6 +870,11 @@ $("pRows").addEventListener("change", async e => {
     } catch (err) { toast(err.message); }
   }
 });
+$("pHead").addEventListener("change", e => {
+  if (e.target.id !== "pSelAll") return;
+  P.shown.forEach(s => e.target.checked ? P.selected.add(s.key) : P.selected.delete(s.key));
+  renderPlaylist();
+});
 $("pRows").addEventListener("keydown", e => {
   if (e.key === "Tab" && e.target.matches(".score")) {
     const boxes = [...$("pRows").querySelectorAll(".score")];
@@ -801,7 +882,7 @@ $("pRows").addEventListener("keydown", e => {
     if (!next) return;
     e.preventDefault();
     const s = P.list.find(x => x.key === e.target.dataset.score);
-    const changed = String(e.target.value) !== String(s?.score ?? "");
+    const changed = String(e.target.value) !== String((s ? mineOf(s) : null) ?? "");
     if (changed) { state.focusKey = next.dataset.score; e.target.blur(); }  // re-render puts focus back
     else { next.focus(); next.select(); }
     return;
@@ -811,12 +892,7 @@ $("pRows").addEventListener("keydown", e => {
 $("pRows").addEventListener("click", async e => {
   const p = e.target.closest("[data-play]"), r = e.target.closest("[data-remove]"), m = e.target.closest("[data-move]");
   if (p) playQueue(P.shown, +p.dataset.play);
-  if (r) {
-    try {
-      await api(`/api/playlists/${state.current}/songs/${encodeURIComponent(r.dataset.remove)}`, {method: "DELETE"});
-      P.list = P.list.filter(s => s.key !== r.dataset.remove); facets(P); renderPlaylist(); loadPlaylists(); loadLibrary();
-    } catch (err) { toast(err.message); }
-  }
+  if (r) removeSongs([r.dataset.remove]);
   if (m) {
     const key = m.dataset.key, dir = +m.dataset.move;
     try {
@@ -828,6 +904,25 @@ $("pRows").addEventListener("click", async e => {
     } catch (err) { toast(err.message); }
   }
 });
+async function removeSongs(keys) {
+  if (!keys.length) return;
+  if (keys.length > 1 && !confirm(`Remove ${keys.length} songs from "${$("plName").textContent}"? Your scores are kept.`)) return;
+  try {
+    const d = await api(`/api/playlists/${state.current}/remove`, {method: "POST", body: {keys}});
+    const gone = new Set(keys);
+    P.list = P.list.filter(s => !gone.has(s.key)); keys.forEach(k => P.selected.delete(k));
+    facets(P); renderPlaylist(); loadPlaylists(); loadLibrary();
+    if (keys.length > 1) toast(`Removed ${d.removed} songs.`);
+  } catch (err) { toast(err.message); }
+}
+$("plSelRemove").onclick = () => removeSongs([...P.selected]);
+$("plSelClear").onclick = () => { P.selected.clear(); renderPlaylist(); };
+$("plSelCopy").onclick = e => {
+  e.stopPropagation();
+  const songs = P.list.filter(s => P.selected.has(s.key));
+  pickPlaylist($("plSelCopy"), songs);
+  pendingAfter = () => { P.selected.clear(); };
+};
 $("plPin").onclick = () => togglePin(state.current);
 $("plPlay").onclick = () => { const i = P.shown.findIndex(srcOf); i < 0 ? toast("Nothing here has audio.") : playQueue(P.shown, i); };
 $("plRename").onclick = async () => {
@@ -836,7 +931,7 @@ $("plRename").onclick = async () => {
   catch (e) { toast(e.message); }
 };
 $("plDelete").onclick = async () => {
-  if (!confirm(`Delete "${$("plName").textContent}"? Its scores go with it (downloaded files stay).`)) return;
+  if (!confirm(`Delete "${$("plName").textContent}"? Your scores stay (they're in All songs). Downloaded files stay too.`)) return;
   try { await api("/api/playlists/" + state.current, {method: "DELETE"}); } catch (e) { return toast(e.message); }
   show("search"); loadPlaylists(); loadLibrary(); renderSearch();
 };
@@ -874,54 +969,68 @@ $("customForm").onsubmit = async e => {
 };
 
 /* ---------- rate mode ---------- */
+// a normal video (or audio) player you control, your score next to it, Enter for the next song
 const R = {list: [], i: 0};
 $("plRate").onclick = () => {
-  let list = P.shown.filter(s => s.score == null);
+  let list = P.shown.filter(s => mineOf(s) == null);
   if (!list.length) {
     if (!P.shown.length) return toast("Nothing to rate here.");
-    if (!confirm("Everything here is rated. Go through them all again?")) return;
+    if (!confirm("You've rated everything here. Go through them all again?")) return;
     list = [...P.shown];
   }
   R.list = list; R.i = 0;
-  $("rateDlg").showModal(); renderRate(true);
+  audio.pause();
+  $("rateDlg").showModal(); renderRate();
 };
-function renderRate(play) {
+const rMedia = () => $("rMedia");
+function stopRateMedia() {
+  const m = rMedia(); if (!m) return;
+  m.pause(); m.removeAttribute("src"); m.load();
+}
+function renderRate() {
+  stopRateMedia();
   const s = R.list[R.i];
   if (!s) {
-    const done = R.list.filter(x => x.score != null);
-    $("rateBody").innerHTML = `<h3>All done</h3><p class="sub">${done.length} of ${R.list.length} rated${done.length ? `, averaging ${avgOf(done).toFixed(2)}` : ""}.</p>
+    const done = R.list.filter(x => mineOf(x) != null);
+    $("rateBody").innerHTML = `<h3>All done</h3><p class="sub">${done.length} of ${R.list.length} rated${done.length ? `, averaging ${(done.reduce((t, x) => t + mineOf(x), 0) / done.length).toFixed(2)}` : ""}.</p>
       <div class="row" style="justify-content:flex-end"><button class="btn primary" data-close>Close</button></div>`;
-    audio.pause();
     return;
   }
-  const big = s.cover || s.coverSmall;
+  const video = s.hq || s.mq, art = s.cover || s.coverSmall, mine = mineOf(s);
+  const media = video
+    ? `<video id="rMedia" class="rvideo" controls autoplay playsinline preload="auto" src="${esc(video)}" ${art ? `poster="${esc(art)}"` : ""}></video>`
+    : `<div class="rart ${art ? "" : "none"}" ${art ? `style="background-image:url('${esc(art)}')"` : ""}></div>`
+      + (s.audio ? `<audio id="rMedia" class="raudio" controls autoplay preload="auto" src="${esc(s.audio)}"></audio>` : `<div class="sub">No audio for this one.</div>`);
   $("rateBody").innerHTML = `
-    <div class="rate">
-      <div class="art ${big ? "" : "none"}" ${big ? `style="background-image:url('${esc(big)}')"` : ""}></div>
-      <div>
-        <div class="sub">${R.i + 1} of ${R.list.length} · ${esc(shortType(s.songType))}${srcOf(s) ? "" : " · no audio for this one"}</div>
+    <div class="rate2">
+      <div class="rmedia">${media}</div>
+      <div class="rside">
+        <div class="sub">${R.i + 1} of ${R.list.length} · ${esc(shortType(s.songType))}</div>
         <h3>${esc(s.songName)}</h3>
         <div class="who">${esc(s.artist)}</div>
         <div class="sub" style="margin-top:4px">${esc([s.anime, s.vintage].filter(Boolean).join(" · "))}</div>
+        ${isFriend() && s.score != null ? `<div class="sub" style="margin-top:8px">Their score: <b>${fmtScore(s.score)}</b></div>` : ""}
         <div class="rscore">
-          <input type="text" inputmode="decimal" id="rScore" value="${s.score ?? ""}" placeholder="–" aria-label="Score out of 10" autocomplete="off">
+          <input type="text" inputmode="decimal" id="rScore" value="${mine ?? ""}" placeholder="–" aria-label="Your score out of 10" autocomplete="off">
           <span class="sub">/ 10</span>
-          <button class="btn primary" type="button" id="rSave">Save &amp; next</button>
         </div>
         <div class="status err" id="rErr"></div>
-        <input type="text" class="rnote" id="rNote" placeholder="Note (optional)" maxlength="500" value="${esc(s.note || "")}">
+        ${isFriend() ? "" : `<input type="text" class="rnote" id="rNote" placeholder="Note (optional)" maxlength="500" value="${esc(s.note || "")}">`}
+        <button class="btn primary wide" type="button" id="rSave" style="margin-top:14px">Save &amp; next →</button>
         <div class="foot">
           <button class="btn sm" type="button" data-step="-1" ${R.i ? "" : "disabled"}>← Back</button>
-          <button class="btn sm" type="button" data-step="1">Skip →</button>
+          <button class="btn sm" type="button" data-step="1">Skip</button>
           <span class="grow"></span>
-          <span class="sub"><kbd>Enter</kbd> save · <kbd>Space</kbd> play/pause · <kbd>Esc</kbd> close</span>
+          <span class="sub"><kbd>Enter</kbd> save · <kbd>Esc</kbd> close</span>
         </div>
       </div>
     </div>`;
-  $("rScore").focus(); $("rScore").select();
-  if (play) {
-    if (srcOf(s)) { state.queue = [s]; state.qi = 0; playCurrent(); } else audio.pause();
+  const m = rMedia();
+  if (m) {
+    m.volume = audio.volume; m.muted = audio.muted;
+    m.play().catch(() => {});  // some browsers want a click first; the controls are right there
   }
+  $("rScore").focus(); $("rScore").select();
 }
 async function rateCurrent() {
   const s = R.list[R.i], box = $("rScore"), raw = box.value.trim().replace(",", ".");
@@ -930,40 +1039,60 @@ async function rateCurrent() {
     box.classList.add("bad"); $("rErr").textContent = "Scores go from 0 to 10, like 8 or 8.3."; box.focus(); return;
   }
   try {
-    const note = $("rNote").value.trim();
-    if (v !== s.score) { await saveScore(s.key, v == null ? "" : v); s.score = v == null ? null : Math.round(v * 100) / 100; }
-    if (note !== (s.note || "")) {
+    if (v !== mineOf(s)) await saveScore(s.key, v == null ? "" : v);
+    const noteBox = $("rNote");
+    if (noteBox && noteBox.value.trim() !== (s.note || "")) {
+      const note = noteBox.value.trim();
       await api(`/api/playlists/${state.current}/songs/${encodeURIComponent(s.key)}`, {method: "PATCH", body: {note}});
-      s.note = note; const p = P.list.find(x => x.key === s.key); if (p) p.note = note;
+      s.note = note;
     }
-    R.i++; renderRate(true);
+    R.i++; renderRate();
   } catch (e) { $("rErr").textContent = e.message; }
 }
 $("rateDlg").addEventListener("click", e => {
   const st = e.target.closest("[data-step]");
   if (e.target.closest("#rSave")) rateCurrent();
-  if (st) { R.i = Math.max(0, R.i + +st.dataset.step); renderRate(true); }
+  if (st) { R.i = Math.max(0, R.i + +st.dataset.step); renderRate(); }
   if (e.target.closest("[data-close]")) $("rateDlg").close();
 });
 $("rateDlg").addEventListener("keydown", e => {
   if (!R.list[R.i]) return;
   if (e.key === "Enter" && (e.target.id === "rScore" || e.target.id === "rNote")) { e.preventDefault(); rateCurrent(); }
-  else if (e.code === "Space" && e.target.id !== "rNote") { e.preventDefault(); togglePlay(); }
 });
 $("rateDlg").addEventListener("input", e => { if (e.target.id === "rScore") { e.target.classList.remove("bad"); $("rErr").textContent = ""; } });
 $("rateDlg").addEventListener("close", () => {
-  if (state.current) { facets(P); renderPlaylist(); loadPlaylists(); loadLibrary(); }
+  stopRateMedia();
+  if (state.current != null) { facets(P); renderPlaylist(); loadPlaylists(); loadLibrary(); }
 });
 
 /* ---------- combining playlists ---------- */
 function openCombine(preselect) {
-  if (state.playlists.length < 2) return toast("You need at least two playlists to combine.");
-  $("combineFrom").innerHTML = state.playlists.map(p => `<label class="chk"><input type="checkbox" value="${p.id}" ${p.id === preselect ? "checked" : ""}>
-    ${esc(p.name)} <span class="sub">${p.count} songs</span></label>`).join("");
-  $("combineInto").innerHTML = `<option value="">A new playlist</option>` + state.playlists.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  if (ownLists().length < 1) return toast("Make a playlist first.");
+  const pick = new Set(preselect != null && preselect !== ALL_ID ? [preselect] : []);
+  $("combineSearch").value = "";
+  $("combineFrom").innerHTML = state.playlists.map(p => `<label class="pickitem" data-name="${esc(p.name.toLowerCase())}">
+      <input type="checkbox" class="chkbox" value="${p.id}" ${pick.has(p.id) ? "checked" : ""}>
+      <span class="pname">${p.kind === "all" ? "&#9733; " : ""}${esc(p.name)}</span>
+      ${p.kind === "friend" ? `<span class="tag FRIEND">friend</span>` : ""}
+      <span class="pcount">${p.count}</span></label>`).join("");
+  $("combineInto").innerHTML = `<option value="">A new playlist</option>` + ownLists().map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
   $("combineName").value = ""; $("combineErr").textContent = ""; $("combineNameField").hidden = false;
-  $("combineDlg").showModal();
+  comboCount(); $("combineDlg").showModal();
 }
+function comboCount() {
+  const n = $("combineFrom").querySelectorAll("input:checked").length;
+  $("combinePicked").textContent = n ? `${n} picked` : "None picked";
+}
+$("combineFrom").addEventListener("change", comboCount);
+$("combineSearch").addEventListener("input", e => {
+  const f = e.target.value.trim().toLowerCase();
+  $("combineFrom").querySelectorAll(".pickitem").forEach(l => l.hidden = !!f && !l.dataset.name.includes(f));
+});
+$("combineAll").onclick = () => {
+  const boxes = [...$("combineFrom").querySelectorAll(".pickitem:not([hidden]) input")];
+  const on = !boxes.every(b => b.checked);
+  boxes.forEach(b => b.checked = on); comboCount();
+};
 $("combineInto").onchange = () => { $("combineNameField").hidden = !!$("combineInto").value; };
 $("combinePl").onclick = () => openCombine(state.current);
 $("plCombine").onclick = () => openCombine(state.current);
@@ -975,7 +1104,7 @@ $("combineForm").onsubmit = async e => {
   try {
     const d = await api("/api/playlists/combine", {method: "POST", body: {sources, into: into || null, name: $("combineName").value}});
     $("combineDlg").close();
-    toast(`${d.added} song${d.added === 1 ? "" : "s"} added to "${d.name}"` + (d.filled ? ` · ${d.filled} unrated songs picked up a score` : ""));
+    toast(`${d.added} song${d.added === 1 ? "" : "s"} added to "${d.name}"`);
     await loadLibrary(); openPlaylist(d.id);
   } catch (err) { $("combineErr").textContent = err.message; }
 };
@@ -1055,7 +1184,7 @@ async function loadStats() {
   let d;
   try { d = await api("/api/stats" + ($("statsScope").value ? "?playlist=" + $("statsScope").value : "")); }
   catch (e) { $("statCards").innerHTML = `<div class="status err">${esc(e.message)}</div>`; return; }
-  renderStats(d.entries, d.playlists);
+  renderStats(d.entries, d.playlists, d.playlistAverages || []);
 }
 function median(xs) { const a = [...xs].sort((x, y) => x - y), m = a.length >> 1; return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2; }
 function groupAvg(songs, keysOf, min = 1) {
@@ -1084,15 +1213,9 @@ function songList(list, from = 1, dir = 1) {
       <span class="badge">${fmtScore(s.score)}</span></div>`).join("")}</div>`;
 }
 const card = (title, sub, body) => `<div class="card"><h3>${title}</h3><div class="sub">${sub}</div>${body}</div>`;
-function renderStats(entries, playlistCount) {
+function renderStats(entries, playlistCount, playlistAverages) {
   const scope = $("statsScope").value;
-  // a song rated in two playlists counts once, with its average score
-  const bySong = new Map();
-  for (const e of entries.filter(e => e.score != null)) {
-    if (!bySong.has(e.key)) bySong.set(e.key, {...e, scores: []});
-    bySong.get(e.key).scores.push(e.score);
-  }
-  const songs = [...bySong.values()].map(s => ({...s, score: s.scores.reduce((a, b) => a + b, 0) / s.scores.length}));
+  const seen = new Set(), songs = entries.filter(e => e.score != null && !seen.has(e.key) && seen.add(e.key));
   const unrated = new Set(entries.filter(e => e.score == null).map(e => e.key)).size;
   if (!songs.length) {
     $("statTiles").innerHTML = "";
@@ -1126,17 +1249,15 @@ function renderStats(entries, playlistCount) {
   const seasons = groupAvg(songs, s => [(s.vintage || "").split(" ")[0]]).filter(r => r.label in SEASON_NUM)
     .sort((a, b) => SEASON_NUM[a.label] - SEASON_NUM[b.label]);
   const formats = sortAvg(groupAvg(songs, s => [s.animeType]));
-  const lists = scope ? [] : sortAvg(groupAvg(entries.filter(e => e.score != null), e => [e.playlist]));
+  const lists = scope ? [] : sortAvg(playlistAverages.map(p => ({label: p.name, value: p.average, count: p.count})));
   const ranked = [...songs].sort((a, b) => b.score - a.score || a.songName.localeCompare(b.songName));
   const gems = songs.filter(s => s.difficulty != null && s.difficulty < 35 && s.score >= 8)
     .sort((a, b) => b.score - a.score || a.difficulty - b.difficulty).slice(0, 8);
-  const split = [...songs].filter(s => s.scores.length > 1).map(s => ({...s, gap: Math.max(...s.scores) - Math.min(...s.scores)}))
-    .filter(s => s.gap > 0).sort((a, b) => b.gap - a.gap).slice(0, 6);
 
   $("statCards").innerHTML = [
     card("Score spread", "How many songs landed on each score", hist),
     card("Openings vs endings", "Average score by song type", bars(types)),
-    card("Your top 10", "Best-rated songs" + (scope ? "" : " across every playlist"), songList(ranked.slice(0, 10))),
+    card("Your top 10", "Best-rated songs" + (scope ? " in this playlist" : ""), songList(ranked.slice(0, 10))),
     ranked.length > 10 ? card("Bottom 5", "Lowest-rated songs", songList(ranked.slice(-5).reverse(), ranked.length, -1)) : "",
     card("Favourite artists", "Highest average, two or more rated songs", bars(artists, {go: "artist"})),
     card("Most rated artists", "Who shows up the most", bars(prolific, {go: "artist"})),
@@ -1149,9 +1270,6 @@ function renderStats(entries, playlistCount) {
     card("Composers", "Highest average, two or more rated songs", bars(composers, {empty: "Composer info only comes with AniSongDB songs."})),
     scope ? "" : card("Playlists", "Average score per playlist", bars(lists)),
     gems.length ? card("Obscure favourites", "Songs you rate 8+ that under 35% of AMQ players guess", songList(gems)) : "",
-    split.length ? card("Changed your mind", "Same song, different scores across playlists",
-      `<div class="songlist">${split.map(s => `<div class="item"><div class="cover ${s.coverSmall ? "" : "none"}" ${s.coverSmall ? `style="background-image:url('${esc(s.coverSmall)}')"` : ""}></div>
-        <div><div class="t">${esc(s.songName)}</div><div class="sub">${esc(s.anime)}</div></div><span class="sub">${s.scores.map(fmtScore).join(" / ")}</span></div>`).join("")}</div>`) : "",
   ].join("");
 }
 

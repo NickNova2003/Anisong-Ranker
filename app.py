@@ -38,6 +38,7 @@ SONG_FIELDS = ("key", "source", "anime", "animeJP", "vintage", "animeType", "son
                "annId", "malId", "anilistId", "artistList", "audio", "hq", "mq", "custom", "link")
 META_FIELDS = ("cover", "coverSmall", "color", "genres", "tags", "anilistUrl")
 NEW_SOURCES = ("animethemes", "mal")
+ALL_ID, ALL_NAME = 0, "All songs"  # built from every playlist plus anything rated; never stored
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 JOBS = {}
@@ -67,15 +68,43 @@ def init_db():
                 key TEXT PRIMARY KEY, fetched REAL NOT NULL, found INTEGER NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS names (
                 kind TEXT NOT NULL, name TEXT NOT NULL COLLATE NOCASE, PRIMARY KEY (kind, name));
+            CREATE TABLE IF NOT EXISTS ratings (
+                song_key TEXT PRIMARY KEY, score REAL, note TEXT NOT NULL DEFAULT '',
+                updated REAL NOT NULL, pos REAL);
         """)
+        if "kind" not in columns(con, "playlists"):
+            # 'own' playlists share one score per song; 'friend' ones keep the scores they came with
+            con.execute("ALTER TABLE playlists ADD COLUMN kind TEXT NOT NULL DEFAULT 'own'")
         if "pinned" not in columns(con, "playlists"):
             con.execute("ALTER TABLE playlists ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
         if "pos" not in columns(con, "playlist_songs"):
             con.execute("ALTER TABLE playlist_songs ADD COLUMN pos REAL")
             con.execute("UPDATE playlist_songs SET pos = added")
+        if not con.execute("SELECT 1 FROM cache WHERE key='ratings-moved'").fetchone():
+            move_scores_to_ratings(con)
         if not con.execute("SELECT 1 FROM names LIMIT 1").fetchone():
             for row in con.execute("SELECT data FROM cache WHERE key LIKE 'season:%'").fetchall():
                 remember_names(con, [src.normalize(x) for x in json.loads(row["data"])])
+
+
+def move_scores_to_ratings(con):
+    """Older versions kept a score per playlist. Now a song has one score everywhere: where a song had
+    different scores, the one from the playlist it was added to most recently wins."""
+    rows = con.execute("""SELECT ps.song_key, ps.score, ps.note, COALESCE(ps.pos, ps.added) AS pos FROM playlist_songs ps
+                          JOIN playlists p ON p.id = ps.playlist_id WHERE p.kind = 'own'
+                          ORDER BY ps.added DESC""").fetchall()
+    best = {}
+    for r in rows:
+        b = best.setdefault(r["song_key"], {"score": None, "note": "", "pos": r["pos"]})
+        if b["score"] is None and r["score"] is not None:
+            b["score"], b["pos"] = r["score"], r["pos"]
+        if not b["note"] and (r["note"] or "").strip():
+            b["note"] = r["note"].strip()
+    now = time.time()
+    con.executemany("INSERT OR IGNORE INTO ratings(song_key, score, note, updated, pos) VALUES (?,?,?,?,?)",
+                    [(k, b["score"], b["note"], now, b["pos"]) for k, b in best.items()
+                     if b["score"] is not None or b["note"]])
+    con.execute("REPLACE INTO cache(key, fetched, data) VALUES ('ratings-moved', ?, '1')", (now,))
 
 
 def columns(con, table):
@@ -112,30 +141,133 @@ def save_song(con, song):
     con.execute("REPLACE INTO songs(key, data) VALUES (?,?)", (str(song["key"]), json.dumps(stored(song))))
 
 
+def playlist_info(con, pid):
+    if pid == ALL_ID:
+        return {"id": ALL_ID, "name": ALL_NAME, "kind": "all", "pinned": True}
+    row = con.execute("SELECT id, name, kind, pinned FROM playlists WHERE id=?", (pid,)).fetchone()
+    if not row:
+        abort(404)
+    return dict(row)
+
+
+def get_playlist_name(con, pid):
+    return playlist_info(con, pid)["name"]
+
+
+def song_out(data, **extra):
+    song = json.loads(data)
+    song.setdefault("source", "custom" if song.get("custom") else "anisongdb")
+    song.update(extra)
+    return song
+
+
 def playlist_rows(con, pid):
+    """Songs with score/note filled in. In a friend's playlist those are theirs, and yours sit in mine/myNote."""
+    if pid == ALL_ID:
+        return all_rows(con)
+    friend = playlist_info(con, pid)["kind"] == "friend"
     rows = con.execute(
-        """SELECT s.data, ps.score, ps.note, ps.added, ps.pos FROM playlist_songs ps
-           JOIN songs s ON s.key = ps.song_key WHERE ps.playlist_id=? ORDER BY ps.added""", (pid,)).fetchall()
-    out = []
-    for r in rows:
-        song = json.loads(r["data"])
-        song.setdefault("source", "custom" if song.get("custom") else "anisongdb")
-        song.update(score=r["score"], note=r["note"] or "", added=r["added"],
-                    pos=r["pos"] if r["pos"] is not None else r["added"])
-        out.append(song)
-    return out
+        """SELECT s.data, ps.score AS theirs, ps.note AS their_note, ps.added, COALESCE(ps.pos, ps.added) AS pos,
+                  r.score AS mine, r.note AS my_note
+           FROM playlist_songs ps JOIN songs s ON s.key = ps.song_key
+           LEFT JOIN ratings r ON r.song_key = ps.song_key
+           WHERE ps.playlist_id=? ORDER BY ps.added""", (pid,)).fetchall()
+    return [song_out(r["data"], score=r["theirs"] if friend else r["mine"],
+                     note=(r["their_note"] if friend else r["my_note"]) or "",
+                     mine=r["mine"], myNote=r["my_note"] or "", added=r["added"], pos=r["pos"]) for r in rows]
+
+
+ALL_KEYS = """WITH own AS (SELECT ps.song_key AS key, MIN(ps.added) AS added FROM playlist_songs ps
+                          JOIN playlists p ON p.id = ps.playlist_id WHERE p.kind = 'own' GROUP BY ps.song_key),
+                   keys AS (SELECT key FROM own UNION SELECT song_key FROM ratings WHERE score IS NOT NULL)"""
+
+
+def all_rows(con):
+    rows = con.execute(ALL_KEYS + """
+        SELECT s.data, r.score, r.note, COALESCE(own.added, r.updated) AS added, r.pos
+        FROM keys k JOIN songs s ON s.key = k.key
+        LEFT JOIN own ON own.key = k.key LEFT JOIN ratings r ON r.song_key = k.key""").fetchall()
+    return [song_out(r["data"], score=r["score"], note=r["note"] or "", mine=r["score"], myNote=r["note"] or "",
+                     added=r["added"] or 0, pos=r["pos"] if r["pos"] is not None else (r["added"] or 0)) for r in rows]
+
+
+def in_playlist(con, pid, key):
+    if pid == ALL_ID:
+        return con.execute(ALL_KEYS + " SELECT 1 FROM keys WHERE key=?", (key,)).fetchone() is not None
+    return con.execute("SELECT 1 FROM playlist_songs WHERE playlist_id=? AND song_key=?", (pid, key)).fetchone() is not None
+
+
+KEEP = object()
+
+
+def set_rating(con, key, score=KEEP, note=KEEP):
+    row = con.execute("SELECT * FROM ratings WHERE song_key=?", (key,)).fetchone()
+    cur = dict(row) if row else {"song_key": key, "score": None, "note": "", "updated": time.time(), "pos": None}
+    if score is not KEEP and score != cur["score"]:
+        cur["score"], cur["updated"] = score, time.time()
+        if score is not None and cur["pos"] is None:
+            cur["pos"] = time.time()
+    if note is not KEEP:
+        cur["note"] = note
+    if cur["score"] is None and not cur["note"]:
+        con.execute("DELETE FROM ratings WHERE song_key=?", (key,))
+    else:
+        con.execute("REPLACE INTO ratings(song_key, score, note, updated, pos) VALUES (?,?,?,?,?)",
+                    (key, cur["score"], cur["note"], cur["updated"], cur["pos"]))
+
+
+def own_playlist(con, pid, action):
+    """Playlists you can add to: not All songs, not a friend's."""
+    info = playlist_info(con, pid)
+    if info["kind"] == "all":
+        raise UserError(f"All songs fills itself in, so you can't {action} there.")
+    if info["kind"] == "friend":
+        raise UserError(f"That's a friend's playlist, so you can't {action} there.")
+    return info
+
+
+def target_playlist(con, into, name, action):
+    """An existing playlist of yours (by id), or a new one with this name. Returns (id, name)."""
+    if into not in (None, ""):
+        return int(into), own_playlist(con, int(into), action)["name"]
+    name = check_name(con, name)
+    return con.execute("INSERT INTO playlists(name, created) VALUES (?,?)", (name, time.time())).lastrowid, name
+
+
+def put_in(con, pid, key, t):
+    """Add a song to a playlist; 1 if it's new there, 0 if it was already in."""
+    return con.execute("INSERT OR IGNORE INTO playlist_songs(playlist_id, song_key, added, pos) VALUES (?,?,?,?)",
+                       (pid, key, t, t)).rowcount
+
+
+def custom_song(name, artist="", anime="", link=None):
+    song = dict.fromkeys(SONG_FIELDS)
+    clip = lambda v: str(v or "").strip()[:300]  # noqa: E731
+    song.update(key="c" + uuid.uuid4().hex[:16], source="custom", custom=True, link=link, songType="Custom",
+                songName=clip(name), artist=clip(artist), anime=clip(anime), animeJP="", vintage="", animeType="",
+                composer="", arranger="", category="", isDub=False, isRebroadcast=False, artistList=[])
+    return song
+
+
+def score_or_error(value):
+    try:
+        return parse_score(value)
+    except (TypeError, ValueError):
+        raise UserError("Score has to be between 0 and 10.")
+
+
+class UserError(Exception):
+    pass
+
+
+@app.errorhandler(UserError)
+def user_error(e):
+    return jsonify(error=str(e)), 400
 
 
 def ranked(songs):
     rated = sorted((s for s in songs if s["score"] is not None), key=lambda s: (-s["score"], s["pos"]))
     return rated, [s for s in songs if s["score"] is None]
-
-
-def get_playlist_name(con, pid):
-    row = con.execute("SELECT name FROM playlists WHERE id=?", (pid,)).fetchone()
-    if not row:
-        abort(404)
-    return row["name"]
 
 
 # ------------------------------------------------------- seasons, covers, genres
@@ -450,13 +582,14 @@ SUGGEST_CACHE = {}
 
 @app.get("/api/library")
 def library():
-    """Which playlists each song is already in, for the badges in search results."""
-    with db() as con:
-        rows = con.execute("""SELECT ps.song_key, ps.score, p.id, p.name FROM playlist_songs ps
-                              JOIN playlists p ON p.id = ps.playlist_id""").fetchall()
+    """Your score and which playlists each song is in, for the badges in search results."""
     out = {}
-    for r in rows:
-        out.setdefault(r["song_key"], []).append({"id": r["id"], "name": r["name"], "score": r["score"]})
+    with db() as con:
+        for r in con.execute("""SELECT ps.song_key, p.name FROM playlist_songs ps JOIN playlists p ON p.id = ps.playlist_id
+                                WHERE p.kind = 'own' ORDER BY p.name COLLATE NOCASE"""):
+            out.setdefault(r["song_key"], {"score": None, "in": []})["in"].append(r["name"])
+        for r in con.execute("SELECT song_key, score FROM ratings WHERE score IS NOT NULL"):
+            out.setdefault(r["song_key"], {"score": None, "in": []})["score"] = r["score"]
     return jsonify(out)
 
 
@@ -465,58 +598,67 @@ def library():
 def list_playlists():
     with db() as con:
         rows = con.execute(
-            """SELECT p.id, p.name, p.pinned, COUNT(ps.song_key) AS count,
-                      SUM(ps.score IS NOT NULL) AS rated, ROUND(AVG(ps.score), 2) AS average
+            """SELECT p.id, p.name, p.pinned, p.kind, COUNT(ps.song_key) AS count,
+                      SUM(CASE WHEN p.kind = 'friend' THEN ps.score ELSE r.score END IS NOT NULL) AS rated,
+                      ROUND(AVG(CASE WHEN p.kind = 'friend' THEN ps.score ELSE r.score END), 2) AS average
                FROM playlists p LEFT JOIN playlist_songs ps ON ps.playlist_id = p.id
+               LEFT JOIN ratings r ON r.song_key = ps.song_key
                GROUP BY p.id ORDER BY p.pinned DESC, p.name COLLATE NOCASE""").fetchall()
-    return jsonify([dict(r) | {"rated": r["rated"] or 0} for r in rows])
+        everything = con.execute(ALL_KEYS + """
+            SELECT COUNT(*) AS count, COUNT(r.score) AS rated, ROUND(AVG(r.score), 2) AS average
+            FROM keys k JOIN songs s ON s.key = k.key LEFT JOIN ratings r ON r.song_key = k.key""").fetchone()
+    first = {"id": ALL_ID, "name": ALL_NAME, "pinned": 1, "kind": "all", "count": everything["count"],
+             "rated": everything["rated"] or 0, "average": everything["average"]}
+    return jsonify([first] + [dict(r) | {"rated": r["rated"] or 0} for r in rows])
+
+
+def check_name(con, name, pid=None):
+    name = str(name or "").strip()[:120]
+    if not name:
+        raise UserError("Give the playlist a name.")
+    if name.lower() == ALL_NAME.lower():
+        raise UserError(f'"{ALL_NAME}" is taken by the built-in list.')
+    if con.execute("SELECT 1 FROM playlists WHERE name=? AND id IS NOT ?", (name, pid)).fetchone():
+        raise UserError("You already have a playlist called that.")
+    return name
 
 
 @app.post("/api/playlists")
 def create_playlist():
-    name = str((request.get_json(force=True) or {}).get("name") or "").strip()[:120]
-    if not name:
-        return jsonify(error="Give the playlist a name."), 400
-    try:
-        with db() as con:
-            cur = con.execute("INSERT INTO playlists(name, created) VALUES (?,?)", (name, time.time()))
-            return jsonify(id=cur.lastrowid, name=name)
-    except sqlite3.IntegrityError:
-        return jsonify(error="You already have a playlist called that."), 409
+    with db() as con:
+        name = check_name(con, (request.get_json(force=True) or {}).get("name"))
+        cur = con.execute("INSERT INTO playlists(name, created) VALUES (?,?)", (name, time.time()))
+        return jsonify(id=cur.lastrowid, name=name)
 
 
 @app.get("/api/playlists/<int:pid>")
 def get_playlist(pid):
     with db() as con:
-        p = con.execute("SELECT id, name, pinned FROM playlists WHERE id=?", (pid,)).fetchone()
-        if not p:
-            abort(404)
+        info = playlist_info(con, pid)
         songs = playlist_rows(con, pid)
     waiting = enrich(songs)
-    return jsonify(id=p["id"], name=p["name"], pinned=bool(p["pinned"]), songs=songs, artPending=waiting)
+    return jsonify(id=info["id"], name=info["name"], kind=info["kind"], pinned=bool(info["pinned"]),
+                   songs=songs, artPending=waiting)
 
 
 @app.patch("/api/playlists/<int:pid>")
 def update_playlist(pid):
     body = request.get_json(force=True) or {}
+    if pid == ALL_ID:
+        raise UserError(f"{ALL_NAME} is built for you, so it can't be renamed or pinned.")
     with db() as con:
-        get_playlist_name(con, pid)
+        playlist_info(con, pid)
         if "pinned" in body:
             con.execute("UPDATE playlists SET pinned=? WHERE id=?", (int(bool(body["pinned"])), pid))
-    if "name" in body:
-        name = str(body.get("name") or "").strip()[:120]
-        if not name:
-            return jsonify(error="Give the playlist a name."), 400
-        try:
-            with db() as con:
-                con.execute("UPDATE playlists SET name=? WHERE id=?", (name, pid))
-        except sqlite3.IntegrityError:
-            return jsonify(error="You already have a playlist called that."), 409
+        if "name" in body:
+            con.execute("UPDATE playlists SET name=? WHERE id=?", (check_name(con, body.get("name"), pid), pid))
     return jsonify(ok=True)
 
 
 @app.delete("/api/playlists/<int:pid>")
 def delete_playlist(pid):
+    if pid == ALL_ID:
+        raise UserError(f"{ALL_NAME} can't be deleted.")
     with db() as con:
         con.execute("DELETE FROM playlists WHERE id=?", (pid,))
     return jsonify(ok=True)
@@ -525,24 +667,41 @@ def delete_playlist(pid):
 @app.post("/api/playlists/<int:pid>/songs")
 def add_songs(pid):
     songs = (request.get_json(force=True) or {}).get("songs") or []
-    added = carried = 0
+    added = rated = 0
     with db() as con:
-        get_playlist_name(con, pid)
+        own_playlist(con, pid, "add songs")
         now = time.time()
-        for i, s in enumerate(songs):
+        for i, s in enumerate(songs[:5000]):
             if not isinstance(s, dict) or not s.get("key") or not s.get("songName"):
                 continue
             key = str(s["key"])
-            save_song(con, s)
-            # rated it in another playlist already? bring the score along
-            prev = con.execute("""SELECT score FROM playlist_songs WHERE song_key=? AND score IS NOT NULL
-                                  ORDER BY rowid DESC LIMIT 1""", (key,)).fetchone()
-            score = prev["score"] if prev else None
-            cur = con.execute("""INSERT OR IGNORE INTO playlist_songs(playlist_id, song_key, score, added, pos)
-                                 VALUES (?,?,?,?,?)""", (pid, key, score, now + i * 1e-4, now + i * 1e-4))
-            added += cur.rowcount
-            carried += cur.rowcount and score is not None
-    return jsonify(added=added, skipped=len(songs) - added, carried=carried)
+            if not con.execute("SELECT 1 FROM songs WHERE key=?", (key,)).fetchone() or s.get("source"):
+                save_song(con, s)
+            new = put_in(con, pid, key, now + i * 1e-4)
+            added += new
+            if new and con.execute("SELECT 1 FROM ratings WHERE song_key=? AND score IS NOT NULL", (key,)).fetchone():
+                rated += 1
+    return jsonify(added=added, skipped=len(songs) - added, carried=rated)
+
+
+@app.post("/api/playlists/<int:pid>/remove")
+def remove_songs(pid):
+    return jsonify(removed=drop(pid, [str(k) for k in (request.get_json(force=True) or {}).get("keys") or []][:5000]))
+
+
+@app.delete("/api/playlists/<int:pid>/songs/<key>")
+def remove_song(pid, key):
+    drop(pid, [key])
+    return jsonify(ok=True)
+
+
+def drop(pid, keys):
+    if pid == ALL_ID:
+        raise UserError(f"Nothing can be removed from {ALL_NAME}. Remove songs from their own playlists instead.")
+    with db() as con:
+        playlist_info(con, pid)
+        return sum(con.execute("DELETE FROM playlist_songs WHERE playlist_id=? AND song_key=?", (pid, k)).rowcount
+                   for k in keys)
 
 
 def parse_score(score):
@@ -556,22 +715,20 @@ def parse_score(score):
 
 @app.patch("/api/playlists/<int:pid>/songs/<key>")
 def update_song(pid, key):
+    """Scores and notes are yours and shared by every playlist (and All songs)."""
     body = request.get_json(force=True) or {}
     with db() as con:
-        if not con.execute("SELECT 1 FROM playlist_songs WHERE playlist_id=? AND song_key=?", (pid, key)).fetchone():
+        info = playlist_info(con, pid)
+        if not in_playlist(con, pid, key):
             return jsonify(error="That song isn't in this playlist any more."), 404
+        score = note = KEEP
         if "score" in body:
-            try:
-                score = parse_score(body["score"])
-            except (TypeError, ValueError):
-                return jsonify(error="Score has to be between 0 and 10."), 400
-            con.execute("UPDATE playlist_songs SET score=? WHERE playlist_id=? AND song_key=?", (score, pid, key))
-            if score is not None:
-                con.execute("""UPDATE playlist_songs SET score=? WHERE song_key=? AND score IS NULL
-                               AND playlist_id != ?""", (score, key, pid))
+            score = score_or_error(body["score"])
         if "note" in body:
-            con.execute("UPDATE playlist_songs SET note=? WHERE playlist_id=? AND song_key=?",
-                        (str(body["note"] or "").strip()[:500], pid, key))
+            if info["kind"] == "friend":
+                raise UserError("Those are your friend's notes.")
+            note = str(body["note"] or "").strip()[:500]
+        set_rating(con, key, score, note)
     return jsonify(ok=True)
 
 
@@ -583,22 +740,29 @@ def move_song(pid, key):
     except (TypeError, ValueError):
         step = 1
     with db() as con:
-        row = con.execute("SELECT score FROM playlist_songs WHERE playlist_id=? AND song_key=?", (pid, key)).fetchone()
-        if not row or row["score"] is None:
-            return jsonify(error="Only rated songs can be moved."), 400
-        group = con.execute("""SELECT song_key, COALESCE(pos, added) AS pos FROM playlist_songs
-                               WHERE playlist_id=? AND score=? ORDER BY COALESCE(pos, added), rowid""",
-                            (pid, row["score"])).fetchall()
+        info = playlist_info(con, pid)
+        if info["kind"] == "friend":
+            raise UserError("A friend's playlist keeps their order.")
+        row = con.execute("SELECT score FROM ratings WHERE song_key=?", (key,)).fetchone()
+        if not row or row["score"] is None or not in_playlist(con, pid, key):
+            raise UserError("Only rated songs can be moved.")
+        if pid == ALL_ID:
+            group = con.execute("""SELECT song_key, COALESCE(pos, updated) AS pos FROM ratings WHERE score=?
+                                   ORDER BY COALESCE(pos, updated), song_key""", (row["score"],)).fetchall()
+            write = "UPDATE ratings SET pos=? WHERE song_key=?"
+        else:
+            group = con.execute("""SELECT ps.song_key, COALESCE(ps.pos, ps.added) AS pos FROM playlist_songs ps
+                                   JOIN ratings r ON r.song_key = ps.song_key WHERE ps.playlist_id=? AND r.score=?
+                                   ORDER BY COALESCE(ps.pos, ps.added), ps.rowid""", (pid, row["score"])).fetchall()
+            write = "UPDATE playlist_songs SET pos=? WHERE song_key=? AND playlist_id=%d" % pid
         keys = [g["song_key"] for g in group]
         i = keys.index(key)
         j = i + step
         if not 0 <= j < len(keys):
             return jsonify(ok=True, moved=False)
-        slots = sorted(g["pos"] for g in group)
-        slots = [p + n * 1e-7 for n, p in enumerate(slots)]  # keep them distinct
+        slots = [p + n * 1e-7 for n, p in enumerate(sorted(g["pos"] for g in group))]  # keep them distinct
         keys[i], keys[j] = keys[j], keys[i]
-        con.executemany("UPDATE playlist_songs SET pos=? WHERE playlist_id=? AND song_key=?",
-                        [(p, pid, k) for p, k in zip(slots, keys)])
+        con.executemany(write, list(zip(slots, keys)))
     return jsonify(ok=True, moved=True)
 
 
@@ -607,47 +771,21 @@ def combine_playlists():
     """Copy the songs of several playlists into a new or existing one. Sources are left alone."""
     body = request.get_json(force=True) or {}
     try:
-        sources = [int(x) for x in body.get("sources") or []]
+        sources = list(dict.fromkeys(int(x) for x in body.get("sources") or []))
         into = int(body["into"]) if body.get("into") not in (None, "") else None
     except (TypeError, ValueError):
         return jsonify(error="Bad playlist ids."), 400
     if not sources:
-        return jsonify(error="Pick at least one playlist to combine."), 400
+        raise UserError("Pick at least one playlist to combine.")
     with db() as con:
         for pid in sources:
-            get_playlist_name(con, pid)
-        if into is None:
-            name = str(body.get("name") or "").strip()[:120]
-            if not name:
-                return jsonify(error="Give the new playlist a name."), 400
-            if con.execute("SELECT 1 FROM playlists WHERE name=?", (name,)).fetchone():
-                return jsonify(error="You already have a playlist called that."), 409
-            into = con.execute("INSERT INTO playlists(name, created) VALUES (?,?)", (name, time.time())).lastrowid
-        else:
-            name = get_playlist_name(con, into)
-        added = filled = 0
+            playlist_info(con, pid)
+        into, name = target_playlist(con, into, body.get("name"), "add songs")
+        rows = [s for pid in sources if pid != into for s in playlist_rows(con, pid)]
+        rows.sort(key=lambda s: (s["mine"] is None, -(s["mine"] or 0)))
         now = time.time()
-        rows = con.execute("""SELECT song_key, score, note FROM playlist_songs
-                              WHERE playlist_id IN (%s) AND playlist_id != ?
-                              ORDER BY score IS NULL, score DESC, COALESCE(pos, added)""" % ",".join("?" * len(sources)),
-                           (*sources, into)).fetchall()
-        for i, r in enumerate(rows):
-            t = now + i * 1e-4
-            cur = con.execute("""INSERT OR IGNORE INTO playlist_songs(playlist_id, song_key, score, note, added, pos)
-                                 VALUES (?,?,?,?,?,?)""", (into, r["song_key"], r["score"], r["note"] or "", t, t))
-            if cur.rowcount:
-                added += 1
-            elif r["score"] is not None:  # already there but unrated: take the score over
-                filled += con.execute("""UPDATE playlist_songs SET score=? WHERE playlist_id=? AND song_key=?
-                                         AND score IS NULL""", (r["score"], into, r["song_key"])).rowcount
-    return jsonify(id=into, name=name, added=added, filled=filled)
-
-
-@app.delete("/api/playlists/<int:pid>/songs/<key>")
-def remove_song(pid, key):
-    with db() as con:
-        con.execute("DELETE FROM playlist_songs WHERE playlist_id=? AND song_key=?", (pid, key))
-    return jsonify(ok=True)
+        added = sum(put_in(con, into, s["key"], now + i * 1e-4) for i, s in enumerate(rows))
+    return jsonify(id=into, name=name, added=added)
 
 
 def clean_link(value):
@@ -671,21 +809,14 @@ def add_custom(pid):
     link = clean_link(body.get("link"))
     if str(body.get("link") or "").strip() and not link:
         return jsonify(error="That link doesn't look like a web address."), 400
-    try:
-        score = parse_score(body.get("score"))
-    except (TypeError, ValueError):
-        return jsonify(error="Score has to be between 0 and 10."), 400
-    song = {k: None for k in SONG_FIELDS}
-    song.update(key="c" + uuid.uuid4().hex[:16], source="custom", custom=True, link=link, songType="Custom",
-                songName=name, artist=str(body.get("artist") or "").strip()[:300],
-                anime=str(body.get("anime") or "").strip()[:300], animeJP="", vintage="", animeType="",
-                composer="", arranger="", category="", isDub=False, isRebroadcast=False, artistList=[])
+    score = score_or_error(body.get("score"))
+    song = custom_song(name, body.get("artist"), body.get("anime"), link)
     with db() as con:
-        get_playlist_name(con, pid)
+        own_playlist(con, pid, "add songs")
         save_song(con, song)
-        now = time.time()
-        con.execute("INSERT INTO playlist_songs(playlist_id, song_key, score, added, pos) VALUES (?,?,?,?,?)",
-                    (pid, song["key"], score, now, now))
+        put_in(con, pid, song["key"], time.time())
+        if score is not None:
+            set_rating(con, song["key"], score)
     return jsonify(ok=True, key=song["key"])
 
 
@@ -713,26 +844,37 @@ def anisongdb_for(song, lookups):
 def swap_song(con, old_key, new):
     save_song(con, new)
     for row in con.execute("SELECT * FROM playlist_songs WHERE song_key=?", (old_key,)).fetchall():
-        there = con.execute("SELECT score, note FROM playlist_songs WHERE playlist_id=? AND song_key=?",
+        there = con.execute("SELECT 1 FROM playlist_songs WHERE playlist_id=? AND song_key=?",
                             (row["playlist_id"], new["key"])).fetchone()
         if there:
             con.execute("""UPDATE playlist_songs SET score=COALESCE(score, ?),
                            note=CASE WHEN note IS NULL OR note='' THEN ? ELSE note END
                            WHERE playlist_id=? AND song_key=?""",
                         (row["score"], row["note"], row["playlist_id"], new["key"]))
-            con.execute("DELETE FROM playlist_songs WHERE playlist_id=? AND song_key=?",
-                        (row["playlist_id"], old_key))
+            con.execute("DELETE FROM playlist_songs WHERE playlist_id=? AND song_key=?", (row["playlist_id"], old_key))
         else:
             con.execute("UPDATE playlist_songs SET song_key=? WHERE playlist_id=? AND song_key=?",
                         (new["key"], row["playlist_id"], old_key))
-    con.execute("DELETE FROM songs WHERE key=? AND key NOT IN (SELECT song_key FROM playlist_songs)", (old_key,))
+    old = con.execute("SELECT * FROM ratings WHERE song_key=?", (old_key,)).fetchone()
+    if old:
+        cur = con.execute("SELECT * FROM ratings WHERE song_key=?", (new["key"],)).fetchone()
+        if not cur:
+            con.execute("UPDATE ratings SET song_key=? WHERE song_key=?", (new["key"], old_key))
+        else:
+            if cur["score"] is None and old["score"] is not None:
+                con.execute("UPDATE ratings SET score=?, pos=? WHERE song_key=?", (old["score"], old["pos"], new["key"]))
+            if not cur["note"] and old["note"]:
+                con.execute("UPDATE ratings SET note=? WHERE song_key=?", (old["note"], new["key"]))
+            con.execute("DELETE FROM ratings WHERE song_key=?", (old_key,))
+    con.execute("""DELETE FROM songs WHERE key=? AND key NOT IN (SELECT song_key FROM playlist_songs)
+                   AND key NOT IN (SELECT song_key FROM ratings)""", (old_key,))
 
 
 def run_match(job=None):
     job = job if job is not None else {}
     with db() as con:
-        rows = con.execute("""SELECT DISTINCT s.key, s.data FROM songs s
-                              JOIN playlist_songs ps ON ps.song_key = s.key""").fetchall()
+        rows = con.execute("""SELECT s.key, s.data FROM songs s WHERE s.key IN
+                              (SELECT song_key FROM playlist_songs UNION SELECT song_key FROM ratings)""").fetchall()
     waiting = [json.loads(r["data"]) for r in rows]
     waiting = [s for s in waiting if s.get("source") in NEW_SOURCES]
     job.update(total=len(waiting), done=0, matched=0, step="Matching new-season songs")
@@ -774,17 +916,14 @@ def auto_match():
 def stats():
     pid = request.args.get("playlist", type=int)
     with db() as con:
-        if pid:
-            playlists = [{"id": pid, "name": get_playlist_name(con, pid)}]
-        else:
-            playlists = [dict(r) for r in con.execute("SELECT id, name FROM playlists")]
-        entries = []
-        for p in playlists:
-            for s in playlist_rows(con, p["id"]):
-                s.update(playlist=p["name"], playlistId=p["id"])
-                entries.append(s)
+        entries = playlist_rows(con, pid if pid else ALL_ID)
+        lists = con.execute("""SELECT p.name, ROUND(AVG(r.score), 2) AS average, COUNT(r.score) AS count
+                               FROM playlists p JOIN playlist_songs ps ON ps.playlist_id = p.id
+                               JOIN ratings r ON r.song_key = ps.song_key AND r.score IS NOT NULL
+                               WHERE p.kind = 'own' GROUP BY p.id""").fetchall()
+        count = con.execute("SELECT COUNT(*) FROM playlists WHERE kind='own'").fetchone()[0]
     enrich(entries, max_batches=3)
-    return jsonify(entries=entries, playlists=len(playlists))
+    return jsonify(entries=entries, playlists=count, playlistAverages=[dict(r) for r in lists])
 
 
 # ------------------------------------------------------- spreadsheet import
@@ -798,7 +937,10 @@ def sheet_read():
                 return jsonify(error="That file is over 20 MB."), 400
         else:
             body = request.get_json(force=True) or {}
-            name, data = body.get("name") or "Pasted rows", str(body.get("text") or "")
+            if body.get("url"):
+                name, data = read_google_sheet(body["url"])
+            else:
+                name, data = body.get("name") or "Pasted rows", str(body.get("text") or "")
         found = sheets.read_upload(name, data)
     except ValueError as e:
         return jsonify(error=str(e)), 400
@@ -806,15 +948,96 @@ def sheet_read():
     return jsonify(name=base, sheets=[{**sh, "guess": sheets.guess(sh["rows"], f"{name} {sh['name']}")} for sh in found])
 
 
+def read_google_sheet(link):
+    url = sheets.google_export_url(link)
+    if not url:
+        raise ValueError("That doesn't look like a Google Sheets link - it should start with docs.google.com/spreadsheets/")
+    try:
+        r = http.get(url, timeout=40)
+    except requests.RequestException:
+        raise ValueError("Couldn't reach Google Sheets just now - check your internet and try again.")
+    private = ("Set the sheet to \"Anyone with the link\" (Share → General access) and try again - "
+               "the app can only open sheets that aren't private.")
+    if r.status_code == 404:
+        raise ValueError("Google says that sheet doesn't exist - check the link.")
+    if r.status_code in (401, 403) or "text/html" in r.headers.get("Content-Type", ""):
+        raise ValueError(private)
+    if not r.ok:
+        raise ValueError(f"Google Sheets answered with an error ({r.status_code}). Try again in a minute.")
+    if len(r.content) > 20 * 1024 * 1024:
+        raise ValueError("That sheet is over 20 MB.")
+    name = "Google Sheet"
+    m = re.search(r"filename\*=UTF-8''([^;]+)|filename=\"([^\"]+)\"", r.headers.get("Content-Disposition", ""))
+    if m:
+        from urllib.parse import unquote
+        name = unquote(m.group(1) or m.group(2))
+    return (name if name.lower().endswith(".xlsx") else name + ".xlsx"), r.content
+
+
+def clean_items(raw, keys):
+    """Rows sent back from the browser: text fields as strings, slot as [type, number] or None."""
+    items = [it for it in raw if isinstance(it, dict) and str(it.get("song") or "").strip()] if isinstance(raw, list) else []
+    for it in items:
+        it.update({k: str(it.get(k) or "") for k in keys})
+        it["slot"] = it.get("slot") if isinstance(it.get("slot"), list) and len(it["slot"]) == 2 else None
+    return items
+
+
+def anime_hits(name):
+    """AnimeThemes' guesses for an anime name, best first, as [(similarity, annId)]. None if it didn't answer."""
+    hits = cache_get("at-find:" + name.lower(), 7 * DAY)
+    if hits is None:
+        try:
+            hits = src.animethemes_find(name)
+            cache_put("at-find:" + name.lower(), hits)
+        except (requests.RequestException, ValueError, KeyError):
+            return None
+        finally:
+            time.sleep(0.4)  # AnimeThemes allows 90 a minute
+    return sorted(((max(src.similar(name, h[0]), src.similar(name, h[1])), h[2]) for h in hits), reverse=True)
+
+
+@app.post("/api/sheet/autopick")
+def sheet_autopick():
+    items = clean_items((request.get_json(force=True) or {}).get("items"), ("anime", "animeClean", "song", "artist", "type"))
+    if not items:
+        raise UserError("Nothing left to pick.")
+    return jsonify(job=start_job(run_autopick, items[:2000]))
+
+
+def run_autopick(job, items):
+    """For each row: the anime's own song list, plus a song name search, and take the closest."""
+    job.update(step="Picking the closest songs", total=len(items), done=0, paused=False)
+    finds = {}
+    for it in items:
+        if job.get("cancel"):
+            return
+        name = it["animeClean"] or sheets.clean_anime(it["anime"])
+        if name and name not in finds:
+            finds[name] = [ann for sim, ann in anime_hits(name) or [] if sim >= 0.6][:3]
+        cands = [c for ann in finds.get(name, []) for c in ann_songs(ann) or []]
+        pick = sheets.auto_pick(it, cands)
+        # the show's own list already has this exact title, so a name search can't do better
+        exact = pick and sheets.title_sim(it["song"], pick["songName"]) >= 0.95
+        if not exact and not job["paused"]:
+            try:
+                cands += [src.normalize(x) for x in src.anisongdb_text(it["song"], ["song"], True, src.anisongdb_flags())[:300]]
+                pick = sheets.auto_pick(it, cands)
+            except src.SearchPaused:
+                job["paused"] = True
+            except (requests.RequestException, ValueError):
+                pass
+        it["match"] = pick
+        job["done"] += 1
+    enrich([it["match"] for it in items if it["match"]])
+    job.update(items=[{"row": it.get("row"), "match": it["match"]} for it in items], state="finished")
+
+
 @app.post("/api/sheet/match")
 def sheet_match():
     body = request.get_json(force=True) or {}
     if isinstance(body.get("items"), list):  # retrying some rows from an earlier run
-        items = [it for it in body["items"][:5000] if isinstance(it, dict) and str(it.get("song") or "").strip()]
-        for it in items:
-            for k in ("anime", "animeClean", "song", "artist", "season", "type"):
-                it[k] = str(it.get(k) or "")
-            it["slot"] = it.get("slot") if isinstance(it.get("slot"), list) and len(it["slot"]) == 2 else None
+        items = clean_items(body["items"][:5000], ("anime", "animeClean", "song", "artist", "season", "type"))
         if not items:
             return jsonify(error="Nothing to retry."), 400
         return jsonify(job=start_job(run_sheet_match, items))
@@ -878,17 +1101,9 @@ def run_sheet_match(job, items):
     for name in names:
         if job.get("cancel"):
             return
-        hits = cache_get("at-find:" + name.lower(), 7 * DAY)
-        if hits is None:
-            try:
-                hits = src.animethemes_find(name)
-                cache_put("at-find:" + name.lower(), hits)
-            except (requests.RequestException, ValueError, KeyError):
-                hits = None
-            time.sleep(0.4)  # AnimeThemes allows 90 a minute
+        scored = anime_hits(name)
         rows = [it for it in left if it["animeClean"] == name]
-        if hits:
-            scored = sorted(((max(src.similar(name, h[0]), src.similar(name, h[1])), h[2]) for h in hits), reverse=True)
+        if scored:
             cands, complete = [], True
             for sim, ann in [x for x in scored if x[0] >= 0.6][:3]:
                 songs = ann_songs(ann)
@@ -935,19 +1150,10 @@ def sheet_import():
     body = request.get_json(force=True) or {}
     rows = body.get("items") or []
     if not rows:
-        return jsonify(error="Nothing ticked to import."), 400
+        raise UserError("Nothing ticked to import.")
     with db() as con:
-        if body.get("into"):
-            pid = int(body["into"])
-            name = get_playlist_name(con, pid)
-        else:
-            name = str(body.get("name") or "").strip()[:120]
-            if not name:
-                return jsonify(error="Give the playlist a name."), 400
-            if con.execute("SELECT 1 FROM playlists WHERE name=?", (name,)).fetchone():
-                return jsonify(error="You already have a playlist called that."), 409
-            pid = con.execute("INSERT INTO playlists(name, created) VALUES (?,?)", (name, time.time())).lastrowid
-        added = same = 0
+        pid, name = target_playlist(con, body.get("into"), body.get("name"), "import")
+        added = same = kept = 0
         now = time.time()
         for i, r in enumerate(rows[:5000]):
             try:
@@ -956,30 +1162,23 @@ def sheet_import():
                 score = None
             if isinstance(r.get("song"), dict) and r["song"].get("key") and r["song"].get("songName"):
                 song = r["song"]
-            elif r.get("custom") and str(r["custom"].get("name") or "").strip():
-                c = r["custom"]
-                song = {k: None for k in SONG_FIELDS}
-                song.update(key="c" + uuid.uuid4().hex[:16], source="custom", custom=True, songType="Custom",
-                            songName=str(c["name"]).strip()[:300], artist=str(c.get("artist") or "").strip()[:300],
-                            anime=str(c.get("anime") or "").strip()[:300], animeJP="", vintage="", animeType="",
-                            composer="", arranger="", category="", isDub=False, isRebroadcast=False, artistList=[])
+            elif isinstance(r.get("custom"), dict) and str(r["custom"].get("name") or "").strip():
+                song = custom_song(r["custom"]["name"], r["custom"].get("artist"), r["custom"].get("anime"))
             else:
                 continue
+            key = str(song["key"])
             save_song(con, song)
-            t = now + i * 1e-4
-            cur = con.execute("""INSERT OR IGNORE INTO playlist_songs(playlist_id, song_key, score, added, pos)
-                                 VALUES (?,?,?,?,?)""", (pid, str(song["key"]), score, t, t))
-            if cur.rowcount:
-                added += 1
-            else:
-                same += 1
-                if score is not None:
-                    con.execute("UPDATE playlist_songs SET score=? WHERE playlist_id=? AND song_key=? AND score IS NULL",
-                                (score, pid, str(song["key"])))
-    return jsonify(id=pid, name=name, added=added, duplicates=same)
+            new = put_in(con, pid, key, now + i * 1e-4)
+            added, same = added + new, same + 1 - new
+            if score is not None:
+                had = con.execute("SELECT score FROM ratings WHERE song_key=? AND score IS NOT NULL", (key,)).fetchone()
+                if had is None:
+                    set_rating(con, key, score)
+                elif had["score"] != score:
+                    kept += 1  # you'd already rated it - your score in the app wins over the sheet
+    return jsonify(id=pid, name=name, added=added, duplicates=same, kept=kept)
 
 
-# --------------------------------------------------------- share / export / import
 def fmt_score(x):
     return ("%.1f" % x).rstrip("0").rstrip(".")
 
@@ -1039,17 +1238,18 @@ def media_ok(url):
 
 @app.post("/api/playlists/import")
 def import_playlist():
+    """A friend's playlist file. It keeps their scores and notes, and never touches yours."""
     data = request.get_json(silent=True)
     if not isinstance(data, dict) or data.get("format") != "anisong-ranker-playlist" \
             or not isinstance(data.get("songs"), list):
         return jsonify(error="That isn't a playlist file from this app."), 400
-    base = str(data.get("name") or "").strip()[:120] or "Imported playlist"
+    base = str(data.get("name") or "").strip()[:110] or "Imported playlist"
     added = 0
     with db() as con:
         name, n = base, 2
-        while con.execute("SELECT 1 FROM playlists WHERE name=?", (name,)).fetchone():
+        while name.lower() == ALL_NAME.lower() or con.execute("SELECT 1 FROM playlists WHERE name=?", (name,)).fetchone():
             name, n = f"{base} ({n})", n + 1
-        pid = con.execute("INSERT INTO playlists(name, created) VALUES (?,?)", (name, time.time())).lastrowid
+        pid = con.execute("INSERT INTO playlists(name, created, kind) VALUES (?,?,'friend')", (name, time.time())).lastrowid
         now = time.time()
         for i, s in enumerate(data["songs"][:5000]):
             if not isinstance(s, dict) or not s.get("key") or not s.get("songName"):
