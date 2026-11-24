@@ -1537,6 +1537,81 @@ def index():
 
 init_db()
 
+# ---------------------------------------------------------------- phone companion
+PHONE_FIELDS = ("key", "songName", "artist", "anime", "songType", "vintage", "custom", "link")
+
+
+@app.get("/api/phone/export")
+def phone_export():
+    """Playlists for the phone app: song details, where to download each one, and your scores."""
+    try:
+        ids = [int(x) for x in request.args.get("ids", "").split(",") if x.strip()]
+    except ValueError:
+        raise UserError("Pick the playlists to send.")
+    if not ids:
+        raise UserError("Pick at least one playlist.")
+    songs, playlists = {}, []
+    with db() as con:
+        for pid in dict.fromkeys(ids):
+            info = playlist_info(con, pid)
+            if info["kind"] == "friend":
+                continue
+            rows = playlist_rows(con, pid)
+            enrich(rows)
+            for r in rows:
+                rated = con.execute("SELECT updated FROM ratings WHERE song_key=?", (r["key"],)).fetchone()
+                songs[r["key"]] = {**{k: r.get(k) for k in PHONE_FIELDS}, "score": r["mine"], "note": r["myNote"],
+                                   "updated": rated["updated"] if rated else 0, "audio": r.get("audio") or r.get("mq"),
+                                   "cover": r.get("cover") or r.get("coverSmall")}
+            playlists.append({"id": pid, "name": info["name"], "all": pid == ALL_ID,
+                              "songs": [[r["key"], r["pos"]] for r in rows]})
+    stamp = time.strftime("%Y-%m-%d %H%M")
+    body = json.dumps({"format": "nick-anisong-phone", "version": 1, "exported": time.time(),
+                       "playlists": playlists, "songs": list(songs.values())}, ensure_ascii=False)
+    return Response(body, mimetype="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="AniSong for phone {stamp}.json"'})
+
+
+@app.post("/api/phone/import")
+def phone_import():
+    """Scores, notes and tie order from the phone. Whichever side changed a song last wins."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or data.get("format") != "nick-anisong-phone-scores":
+        raise UserError("That isn't a scores file from the phone app.")
+    took = older = gone = 0
+    with db() as con:
+        for r in data.get("songs") or []:
+            if not isinstance(r, dict):
+                continue
+            key = str(r.get("key") or "")
+            if not con.execute("SELECT 1 FROM songs WHERE key=?", (key,)).fetchone():
+                gone += 1
+                continue
+            have = con.execute("SELECT updated FROM ratings WHERE song_key=?", (key,)).fetchone()
+            when = float(r.get("changed") or 0)
+            if have and have["updated"] >= when:
+                older += 1
+                continue
+            try:
+                score = None if r.get("score") in (None, "") else parse_score(r["score"])
+            except (TypeError, ValueError):
+                continue
+            set_rating(con, key, score, str(r.get("note") or "")[:2000])
+            con.execute("UPDATE ratings SET updated=? WHERE song_key=?", (when, key))
+            took += 1
+        for o in data.get("orders") or []:  # songs nudged past others with the same score
+            try:
+                pid, keys = int(o["id"]), [str(k) for k in o["keys"]]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if pid == ALL_ID:
+                con.executemany("UPDATE ratings SET pos=? WHERE song_key=?", [(i, k) for i, k in enumerate(keys)])
+            elif con.execute("SELECT 1 FROM playlists WHERE id=? AND kind='own'", (pid,)).fetchone():
+                con.executemany("UPDATE playlist_songs SET pos=? WHERE playlist_id=? AND song_key=?",
+                                [(i, pid, k) for i, k in enumerate(keys)])
+    return jsonify(took=took, older=older, gone=gone)
+
+
 if __name__ == "__main__":
     threading.Thread(target=auto_match, daemon=True).start()
     print("Running on http://127.0.0.1:5000")

@@ -1,0 +1,550 @@
+"use strict";
+/* Nick's AniSong - the phone side. Everything lives on the phone (IndexedDB): playlists and scores come in
+   from the PC app's "Send to phone" file, songs download straight from AniSongDB, and scores go back as a file. */
+
+const $ = id => document.getElementById(id);
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const now = () => Date.now() / 1000;
+const fmtScore = v => v == null ? "" : String(+(+v).toFixed(2));
+const fmtTime = t => !isFinite(t) || t < 0 ? "0:00" : `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
+const fmtSize = b => b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b < 1e6 ? "<1 MB" : Math.round(b / 1e6) + " MB";
+const shuffled = a => { a = [...a]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+const store = (k, v) => { try { if (v === undefined) return JSON.parse(localStorage.getItem(k)); localStorage.setItem(k, JSON.stringify(v)); } catch (e) { return null; } };
+
+/* ---------- storage ---------- */
+const DB = new Promise((ok, fail) => {
+  const r = indexedDB.open("nick-anisong", 1);
+  r.onupgradeneeded = () => { const d = r.result; d.createObjectStore("songs", {keyPath: "key"}); d.createObjectStore("lists", {keyPath: "id"}); d.createObjectStore("blobs"); };
+  r.onsuccess = () => ok(r.result); r.onerror = () => fail(r.error);
+});
+async function tx(name, mode, fn) {
+  const d = await DB;
+  return new Promise((ok, fail) => {
+    const t = d.transaction(name, mode), out = fn(t.objectStore(name));
+    t.oncomplete = () => ok(out && "result" in out ? out.result : out);
+    t.onerror = t.onabort = () => fail(t.error);
+  });
+}
+const putSong = s => tx("songs", "readwrite", st => st.put(s));
+const putList = l => tx("lists", "readwrite", st => st.put(l));
+const getBlob = k => tx("blobs", "readonly", st => st.get(k));
+const putBlob = (k, b) => tx("blobs", "readwrite", st => st.put(b, k));
+const delBlobs = ks => tx("blobs", "readwrite", st => ks.forEach(k => st.delete(k)));
+
+const S = {songs: new Map(), lists: [], have: new Set(), covers: new Map(), tab: "library", list: null,
+           q: "", rankScope: "", rankDir: "top", rankMin: 0, lastExport: store("lastExport") || 0};
+const D = new Map();  // playlist id -> download progress {done, total, failed, stop}
+
+async function boot() {
+  const [songs, lists, keys] = await Promise.all([tx("songs", "readonly", st => st.getAll()), tx("lists", "readonly", st => st.getAll()),
+                                                  tx("blobs", "readonly", st => st.getAllKeys())]);
+  songs.forEach(s => S.songs.set(s.key, s));
+  S.lists = lists.sort((a, b) => (b.all - a.all) || a.name.localeCompare(b.name));
+  keys.filter(k => k.startsWith("a:")).forEach(k => S.have.add(k.slice(2)));
+  await Promise.all(keys.filter(k => k.startsWith("c:")).map(k => getBlob(k).then(b => b && S.covers.set(k.slice(2), URL.createObjectURL(b)))));
+  if (!S.lists.length) S.tab = "sync";
+  render(); badge();
+}
+
+/* ---------- helpers ---------- */
+const song = k => S.songs.get(k);
+const listById = id => S.lists.find(l => l.id === id);
+const canPlay = k => S.have.has(k) || (navigator.onLine && !!(song(k) || {}).audio);
+const coverOf = s => (s && (S.covers.get(s.cover) || (navigator.onLine && s.cover))) || "";
+const img = (s, cls = "cv") => { const c = coverOf(s); return `<img class="${cls}${c ? "" : " ph"}" ${c ? `src="${esc(c)}"` : ""} alt="" loading="lazy" referrerpolicy="no-referrer">`; };
+const subOf = s => [s.artist, s.anime].filter(Boolean).join(" · ");
+function ranked(list) {  // the PC app's order: score high to low, ties by your nudges, then unrated
+  const pos = new Map(list.items);
+  return list.items.map(([k]) => k).filter(k => S.songs.has(k)).sort((a, b) => {
+    const x = song(a).score, y = song(b).score;
+    if ((x == null) !== (y == null)) return x == null ? 1 : -1;
+    return (x != null && y !== x ? y - x : 0) || pos.get(a) - pos.get(b);
+  });
+}
+function toast(msg, ms = 2600) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), ms);
+}
+function changes() { return [...S.songs.values()].filter(s => s.changed > S.lastExport).length + S.lists.filter(l => l.orderChanged > S.lastExport).length; }
+function badge() { const n = changes(); $("badge").hidden = !n; $("badge").textContent = n > 99 ? "99+" : n; }
+
+/* ---------- screens ---------- */
+let renderTimer;
+const renderSoon = () => { clearTimeout(renderTimer); renderTimer = setTimeout(render, 250); };
+function render() {
+  const inList = S.tab === "lists" && S.list != null && listById(S.list);
+  document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === S.tab));
+  $("back").hidden = !inList; $("topExtra").innerHTML = "";
+  const v = $("view"), y = window.scrollY, same = render.last === S.tab + S.list;
+  render.last = S.tab + S.list;
+  if (inList) { $("title").textContent = inList.name; v.innerHTML = listView(inList); }
+  else { $("title").textContent = {library: "Library", ranked: "Ranked", lists: "Playlists", sync: "Sync"}[S.tab]; v.innerHTML = VIEWS[S.tab](); }
+  if (same) window.scrollTo(0, y);
+  const q = $("q"); if (q && render.focus) { q.focus(); q.setSelectionRange(q.value.length, q.value.length); }
+  markNow();
+}
+function songRow(k, {rank, nudge, ctx} = {}) {
+  const s = song(k), have = S.have.has(k);
+  const state = have ? "" : s.audio || s.custom ? (navigator.onLine && s.audio ? `<span class="dl">online</span>` : `<span class="dl">&#8681;</span>`) : "";
+  return `<div class="song${canPlay(k) ? "" : " off"}" data-key="${esc(k)}" data-ctx="${ctx}">
+    ${rank ? `<span class="rank">${rank}</span>` : ""}${img(s)}
+    <div class="meta"><div class="t">${esc(s.songName)}</div><div class="s">${esc(subOf(s))}</div></div>${state}
+    ${nudge ? `<span class="nudge"><button data-nudge="-1" ${nudge.up ? "" : "disabled style=visibility:hidden"}>&#9650;</button><button data-nudge="1" ${nudge.down ? "" : "disabled style=visibility:hidden"}>&#9660;</button></span>` : ""}
+    <span class="score${s.score == null ? " none" : ""}">${s.score == null ? "-" : fmtScore(s.score)}</span>
+    <button class="more" data-more aria-label="More">&#8942;</button></div>`;
+}
+const CTX = {};  // what "play from here" plays, per screen
+const VIEWS = {
+  library() {
+    const all = [...S.have].filter(k => S.songs.has(k)).sort((a, b) => song(a).songName.localeCompare(song(b).songName));
+    if (!all.length) return S.lists.length ? `<div class="empty"><b>Nothing downloaded yet</b>Open a playlist and tap <b>Download</b>, then your songs show up here.</div>` : VIEWS.sync();
+    const f = S.q.trim().toLowerCase();
+    const keys = f ? all.filter(k => { const s = song(k); return [s.songName, s.artist, s.anime].join(" ").toLowerCase().includes(f); }) : all;
+    CTX.library = keys;
+    return `<input class="search" id="q" type="search" placeholder="Search ${all.length} songs" value="${esc(S.q)}">
+      <div class="bar"><button class="btn primary" data-play="library" data-shuffle="1">&#128256; Shuffle</button><button class="btn" data-play="library">&#9654; Play all</button></div>
+      ${keys.map(k => songRow(k, {ctx: "library"})).join("") || `<div class="empty">No matches.</div>`}`;
+  },
+  ranked() {
+    if (!S.lists.length) return VIEWS.sync();
+    const scope = listById(+S.rankScope) || S.lists.find(l => l.all);
+    let keys = scope ? ranked(scope) : [...new Set(S.lists.flatMap(l => ranked(l)))];
+    if (!scope) keys.sort((a, b) => (song(b).score ?? -1) - (song(a).score ?? -1));
+    keys = keys.filter(k => song(k).score != null && song(k).score >= S.rankMin);
+    const playable = keys.filter(k => S.have.has(k)), missing = keys.length - playable.length;
+    if (S.rankDir === "bottom") playable.reverse();
+    CTX.ranked = playable;
+    const n = playable.length, ranks = new Map(keys.map((k, i) => [k, i + 1]));
+    return `<div class="bar">
+        <select class="sel" id="rankScope">${S.lists.map(l => `<option value="${l.id}" ${scope && scope.id === l.id ? "selected" : ""}>${l.all ? "&#9733; " : ""}${esc(l.name)}</option>`).join("")}</select>
+        <select class="sel" id="rankMin">${[0, 5, 6, 7, 8, 9].map(m => `<option value="${m}" ${S.rankMin === m ? "selected" : ""}>${m ? m + " and up" : "Any score"}</option>`).join("")}</select></div>
+      <div class="bar"><button class="chip ${S.rankDir === "top" ? "on" : ""}" data-dir="top">Top first</button><button class="chip ${S.rankDir === "bottom" ? "on" : ""}" data-dir="bottom">Bottom first</button>
+        <span class="grow"></span><button class="btn primary" data-play="ranked" ${n ? "" : "disabled"}>&#9654; Play</button><button class="btn" data-play="ranked" data-shuffle="1" ${n ? "" : "disabled"}>&#128256;</button></div>
+      ${missing ? `<div class="sub" style="margin-bottom:8px">${missing} rated song${missing === 1 ? " isn't" : "s aren't"} downloaded, so ${missing === 1 ? "it's" : "they're"} left out.</div>` : ""}
+      ${playable.map(k => songRow(k, {rank: ranks.get(k), ctx: "ranked"})).join("") || `<div class="empty">No downloaded songs rated ${S.rankMin ? S.rankMin + " or more" : "yet"}.</div>`}`;
+  },
+  lists() {
+    if (!S.lists.length) return VIEWS.sync();
+    return S.lists.map(l => {
+      const keys = l.items.map(([k]) => k).filter(k => S.songs.has(k)), got = keys.filter(k => S.have.has(k));
+      const size = got.reduce((t, k) => t + (song(k).size || 0), 0), d = D.get(l.id), rated = keys.filter(k => song(k).score != null).length;
+      return `<div class="card plist" data-list="${l.id}"><div class="meta"><h3>${l.all ? "&#9733; " : ""}${esc(l.name)}</h3>
+        <div class="sub">${keys.length} songs · ${rated} rated · ${got.length} downloaded${size ? " · " + fmtSize(size) : ""}</div>
+        ${d ? `<div class="prog"><i style="width:${(100 * d.done / Math.max(d.total, 1)).toFixed(1)}%"></i></div>` : ""}</div><span style="font-size:24px;color:var(--faint)">&#8250;</span></div>`;
+    }).join("");
+  },
+  sync() {
+    const n = changes(), last = S.lastExport ? new Date(S.lastExport * 1000).toLocaleString() : "never";
+    setTimeout(storageLine);
+    return `${S.lists.length ? "" : `<div class="card"><h3>Getting started</h3><ol class="steps">
+        <li>On your PC, open the app and click <b>Send to phone</b>.</li><li>Send that file to your phone (WhatsApp, Drive, email).</li>
+        <li>Tap <b>Import from PC</b> below and pick the file. Songs start downloading straight away.</li></ol></div>`}
+      <div class="card"><h3>From your PC</h3><div class="sub" style="margin-bottom:12px">Brings in playlists and your PC scores. If you changed a song on both, the newer change wins.</div>
+        <button class="btn primary wide" id="importBtn">Import from PC</button></div>
+      ${S.lists.length ? `<div class="card"><h3>Back to your PC</h3><div class="sub" style="margin-bottom:12px">${n ? `<b style="color:var(--text)">${n} change${n === 1 ? "" : "s"}</b> not sent yet.` : "Everything's been sent."} Last sent: ${last}.<br>Open the file in the PC app with <b>Import</b>.</div>
+        <button class="btn ${n ? "primary" : ""} wide" id="exportBtn">Send scores to PC</button></div>` : ""}
+      <div class="card"><h3>Storage</h3><div class="sub" id="storage">Checking…</div>
+        ${S.lists.length ? `<button class="btn wide" id="dlAll" style="margin-top:12px">Download every playlist</button>` : ""}</div>
+      ${installPrompt ? `<button class="btn primary wide" id="installBtn">Install as an app</button>` : ""}`;
+  },
+};
+async function storageLine() {
+  const el = $("storage"); if (!el) return;
+  const used = [...S.have].reduce((t, k) => t + ((song(k) || {}).size || 0), 0);
+  let line = `${S.have.size} songs downloaded (${fmtSize(used)}).`;
+  try { const e = await navigator.storage.estimate(); line += ` About ${fmtSize(Math.max(e.quota - e.usage, 0))} free for the app.`; } catch (e) { /* not supported */ }
+  try { if (navigator.storage.persisted && !(await navigator.storage.persisted())) line += " Install the app so Android keeps your downloads."; } catch (e) { /* ignore */ }
+  el.textContent = line;
+}
+function listView(l) {
+  const keys = ranked(l), d = D.get(l.id), missing = keys.filter(k => !S.have.has(k) && song(k).audio && !song(k).noDl).length;
+  CTX["list" + l.id] = keys;
+  const got = keys.filter(k => S.have.has(k)).length;
+  const dlBtn = d ? `<button class="btn" id="dlStop">Stop (${d.done}/${d.total})</button>`
+    : missing ? `<button class="btn" id="dlList">&#8681; Download ${missing}</button>` : "";
+  return `<div class="bar"><button class="btn primary" id="rateBtn">&#9733; Rate</button>
+      <button class="btn" data-play="list${l.id}">&#9654;</button><button class="btn" data-play="list${l.id}" data-shuffle="1">&#128256;</button>
+      ${dlBtn}<span class="grow"></span><button class="icon" id="listMore" aria-label="More">&#8942;</button></div>
+    ${d ? `<div class="prog" style="margin:-4px 0 12px"><i style="width:${(100 * d.done / Math.max(d.total, 1)).toFixed(1)}%"></i></div>` : ""}
+    <div class="sub" style="margin-bottom:6px">${keys.length} songs · ${got} downloaded</div>
+    ${keys.map((k, i) => {
+      const sc = song(k).score, up = i > 0 && sc != null && song(keys[i - 1]).score === sc, down = i < keys.length - 1 && sc != null && song(keys[i + 1]).score === sc;
+      return songRow(k, {rank: sc == null ? "" : i + 1, nudge: up || down ? {up, down} : null, ctx: "list" + l.id});
+    }).join("")}`;
+}
+
+/* ---------- player ---------- */
+const A = new Audio();
+const P = {queue: [], i: -1, order: null, shuffle: false, repeat: "off", sleep: 0, sleepEnd: false, url: null, key: null, single: false};
+async function playQueue(keys, start = 0, shuffle = false) {
+  keys = keys.filter(canPlay);
+  if (!keys.length) return toast(navigator.onLine ? "Nothing here can play yet - download it first." : "Nothing downloaded here yet.");
+  if (shuffle) { keys = shuffled(keys); start = 0; }
+  P.queue = keys; P.order = null; P.shuffle = shuffle; P.single = false; P.i = Math.min(start, keys.length - 1);
+  await load(true);
+}
+async function load(play) {
+  const k = P.queue[P.i]; if (k == null) return;
+  const s = song(k); let src = null;
+  if (S.have.has(k)) { const b = await getBlob("a:" + k); if (b) src = URL.createObjectURL(b); else S.have.delete(k); }
+  if (!src && navigator.onLine && s.audio) src = s.audio;
+  if (!src) { toast(`"${s.songName}" isn't downloaded - skipped`); return P.i < P.queue.length - 1 ? (P.i++, load(play)) : undefined; }
+  const old = P.url;
+  P.url = src.startsWith("blob:") ? src : null; P.key = k;
+  A.src = src; if (play) A.play().catch(() => {});
+  if (old) setTimeout(() => URL.revokeObjectURL(old), 1000);
+  drawPlayer(); markNow(); mediaInfo(s);
+}
+function next(auto) {
+  if (auto && P.repeat === "one") { A.currentTime = 0; return A.play(); }
+  if (auto && P.sleepEnd) { P.sleepEnd = false; drawSleep(); return; }
+  if (P.single) return;
+  if (P.i < P.queue.length - 1) { P.i++; return load(true); }
+  if (P.repeat === "all" && P.queue.length) { P.i = 0; return load(true); }
+  if (!auto) toast("End of the queue");
+}
+function prev() {
+  if (A.currentTime > 3 || P.i <= 0) { A.currentTime = 0; return; }
+  P.i--; load(true);
+}
+const toggle = () => { if (!P.key) return; A.paused ? A.play().catch(() => {}) : A.pause(); };
+A.addEventListener("ended", () => next(true));
+A.addEventListener("error", () => { if (P.key) { toast("That song wouldn't play"); if (!P.single) setTimeout(() => next(false), 600); } });
+["play", "pause"].forEach(ev => A.addEventListener(ev, drawPlayState));
+A.addEventListener("timeupdate", () => {
+  const d = A.duration || 0, t = A.currentTime;
+  $("miniBar").firstChild.style.width = d ? (100 * t / d) + "%" : 0;
+  if (!$("player").hidden && !seeking) { $("pSeek").value = d ? Math.round(1000 * t / d) : 0; $("pNow").textContent = fmtTime(t); $("pDur").textContent = fmtTime(d); }
+  const rs = $("rSeek"); if (rs && !seeking) { rs.value = d ? Math.round(1000 * t / d) : 0; $("rTime").textContent = `${fmtTime(t)} / ${fmtTime(d)}`; }
+  if ("setPositionState" in (navigator.mediaSession || {}) && d) try { navigator.mediaSession.setPositionState({duration: d, position: Math.min(t, d), playbackRate: 1}); } catch (e) { /* ignore */ }
+});
+function drawPlayState() {
+  const icon = A.paused ? "&#9654;" : "&#10074;&#10074;";
+  $("miniPlay").innerHTML = icon; $("pPlay").innerHTML = icon; const rp = $("rPlay"); if (rp) rp.innerHTML = icon;
+  if (navigator.mediaSession) navigator.mediaSession.playbackState = A.paused ? "paused" : "playing";
+}
+function drawPlayer() {
+  const s = song(P.key); if (!s) return;
+  document.body.classList.toggle("mini", true); $("mini").hidden = false;
+  const c = coverOf(s);
+  for (const id of ["miniCover", "pCover"]) { $(id).src = c || ""; $(id).classList.toggle("ph", !c); if (!c) $(id).removeAttribute("src"); }
+  $("miniTitle").textContent = $("pTitle").textContent = s.songName;
+  $("miniSub").textContent = s.artist; $("pSub").textContent = subOf(s);
+  $("pScore").textContent = s.score == null ? "" : "★ " + fmtScore(s.score);
+  $("pShuffle").classList.toggle("on", P.shuffle);
+  $("pRepeat").classList.toggle("on", P.repeat !== "off"); $("pRepeat").innerHTML = P.repeat === "one" ? "&#128258;" : "&#128257;";
+  drawPlayState(); drawSleep(); if (!$("pQueue").hidden) drawQueue();
+}
+function drawQueue() {
+  const up = P.queue.slice(P.i + 1, P.i + 101);
+  $("pQueue").innerHTML = `<h4>Now playing</h4>${songRow(P.key, {ctx: "queue"})}<h4>Up next${P.queue.length - P.i - 1 > 100 ? " (first 100)" : ""}</h4>`
+    + (up.map((k, j) => songRow(k, {ctx: "queue"}).replace('data-more aria-label="More">&#8942;', `data-qdel="${P.i + 1 + j}" aria-label="Remove">&#10005;`)).join("") || `<div class="sub">Nothing after this one.</div>`);
+}
+function markNow() { document.querySelectorAll(".song").forEach(el => el.classList.toggle("now", el.dataset.key === P.key)); }
+function mediaInfo(s) {
+  if (!navigator.mediaSession) return;
+  const c = coverOf(s);
+  navigator.mediaSession.metadata = new MediaMetadata({title: s.songName, artist: s.artist || "", album: s.anime || "",
+                                                       artwork: c ? [{src: c, sizes: "512x512"}] : []});
+}
+if (navigator.mediaSession) {
+  const ms = navigator.mediaSession, on = (a, f) => { try { ms.setActionHandler(a, f); } catch (e) { /* not supported */ } };
+  on("play", () => A.play()); on("pause", () => A.pause()); on("nexttrack", () => next(false)); on("previoustrack", prev);
+  on("seekto", e => { A.currentTime = e.seekTime; }); on("seekbackward", () => { A.currentTime -= 10; }); on("seekforward", () => { A.currentTime += 10; });
+}
+function setShuffle(on) {
+  if (on === P.shuffle) return;
+  const rest = P.queue.slice(P.i + 1), done = P.queue.slice(0, P.i + 1);
+  if (on) { P.order = P.queue.slice(); P.queue = [...done, ...shuffled(rest)]; }
+  else if (P.order) { const left = new Set(rest); P.queue = [...done, ...P.order.filter(k => left.has(k) && !done.includes(k))]; }
+  P.shuffle = on; drawPlayer();
+}
+function setSleep(mins) {
+  clearTimeout(P.sleep); P.sleep = 0; P.sleepEnd = mins === "end"; P.sleepAt = 0;
+  if (typeof mins === "number" && mins) { P.sleepAt = Date.now() + mins * 60000; P.sleep = setTimeout(() => { A.pause(); P.sleep = 0; P.sleepAt = 0; drawSleep(); toast("Sleep timer: paused"); }, mins * 60000); }
+  drawSleep();
+}
+function drawSleep() {
+  const b = $("pSleep");
+  b.textContent = P.sleepEnd ? "Sleep: end of song" : P.sleepAt ? `Sleep: ${Math.max(1, Math.round((P.sleepAt - Date.now()) / 60000))}m` : "Sleep";
+  b.classList.toggle("on", !!(P.sleepEnd || P.sleepAt));
+}
+setInterval(() => { if (P.sleepAt) drawSleep(); }, 30000);
+function queueAdd(k, nextUp) {
+  if (!canPlay(k)) return toast("Download it first.");
+  if (!P.key) return playQueue([k]);
+  P.single = false;
+  P.queue.splice(nextUp ? P.i + 1 : P.queue.length, 0, k); if (P.order) P.order.push(k);
+  toast(nextUp ? "Plays next" : "Added to the queue"); if (!$("pQueue").hidden) drawQueue();
+}
+
+/* ---------- layers (Android back button closes them) ---------- */
+let swapMenu = false;  // a menu choice that opens a screen takes the menu's place in history, so Back stays in step
+function openLayer(id) { $(id).hidden = false; history[swapMenu ? "replaceState" : "pushState"]({layer: id}, ""); swapMenu = false; }
+function closeTop() {
+  if (!$("menu").hidden) return closeMenu();
+  if (!$("rate").hidden) { $("rate").hidden = true; renderSoon(); return; }
+  if (!$("player").hidden) { $("player").hidden = true; return; }
+  if (S.tab === "lists" && S.list != null) { S.list = null; render(); }
+}
+window.addEventListener("popstate", closeTop);
+const back = () => history.back();
+
+function menu(html) { $("menu").innerHTML = html; $("menu").hidden = $("shade").hidden = false; history.pushState({layer: "menu"}, ""); }
+function closeMenu() { $("menu").hidden = $("shade").hidden = true; }
+$("shade").onclick = back;
+function songMenu(k) {
+  const s = song(k), have = S.have.has(k), list = S.list;
+  menu(`<div class="mhead">${img(s)}<div class="meta"><div class="t">${esc(s.songName)}</div><div class="s">${esc(subOf(s))}</div></div></div>
+    <button class="mi" data-act="next">&#9197; Play next</button><button class="mi" data-act="queue">&#10133; Add to queue</button>
+    <button class="mi" data-act="rate">&#9733; Rate this song</button>
+    ${!have && s.audio ? `<button class="mi" data-act="dl">&#8681; Download</button>` : ""}
+    <button class="mi" data-act="file">&#127925; ${s.own ? "Change" : "Add"} audio file${s.custom ? "" : " (your own)"}</button>
+    ${have ? `<button class="mi danger" data-act="del">&#128465; Remove download</button>` : ""}`);
+  $("menu").onclick = async e => {
+    const a = e.target.closest("[data-act]"); if (!a) return;
+    const act = a.dataset.act;
+    if (act === "rate") { closeMenu(); swapMenu = true; } else back();
+    if (act === "next" || act === "queue") queueAdd(k, act === "next");
+    else if (act === "rate") openRate(list != null && listById(list) ? ranked(listById(list)) : [k], k);
+    else if (act === "dl") { await fetchSong(k); render(); }
+    else if (act === "file") { audioFor = k; $("audioFile").click(); }
+    else if (act === "del") { await delBlobs(["a:" + k]); S.have.delete(k); s.own = false; await putSong(s); render(); }
+  };
+}
+let audioFor = null;
+$("audioFile").onchange = async e => {
+  const f = e.target.files[0]; e.target.value = ""; const s = song(audioFor); if (!f || !s) return;
+  try { await putBlob("a:" + s.key, f); } catch (err) { return toast("Couldn't save it - is the phone full?"); }
+  S.have.add(s.key); s.own = true; s.size = f.size; await putSong(s);
+  toast(`Added "${f.name}"`); render(); if (!$("rate").hidden) drawRate();
+};
+
+/* ---------- downloads ---------- */
+async function fetchSong(k) {
+  const s = song(k); if (!s || S.have.has(k) || !s.audio) return true;
+  try {
+    const r = await fetch(s.audio); if (!r.ok) throw new Error(r.status);
+    const b = await r.blob(); await putBlob("a:" + k, b);
+    s.size = b.size; s.noDl = false; S.have.add(k); await putSong(s);
+    fetchCover(s); return true;
+  } catch (err) {
+    if (err && err.name === "QuotaExceededError") throw err;
+    s.noDl = true; await putSong(s); return false;
+  }
+}
+async function fetchCover(s) {
+  if (!s.cover || S.covers.has(s.cover) || fetchCover.busy.has(s.cover)) return;
+  fetchCover.busy.add(s.cover);
+  try { const r = await fetch(s.cover); if (r.ok) { const b = await r.blob(); await putBlob("c:" + s.cover, b); S.covers.set(s.cover, URL.createObjectURL(b)); } } catch (e) { /* online later */ }
+  fetchCover.busy.delete(s.cover);
+}
+fetchCover.busy = new Set();
+async function downloadList(id) {
+  const l = listById(id); if (!l || D.has(id)) return;
+  if (!navigator.onLine) return toast("You're offline - connect to download.");
+  try { if (navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* ignore */ }
+  const keys = ranked(l).filter(k => !S.have.has(k) && song(k).audio);
+  if (!keys.length) return toast("Everything here is downloaded.");
+  const d = {done: 0, total: keys.length, failed: 0, stop: false}; D.set(id, d); render();
+  const work = async () => {
+    while (keys.length && !d.stop) {
+      const k = keys.shift();
+      try { if (!(await fetchSong(k))) d.failed++; } catch (err) { d.stop = true; toast("The phone is out of space for downloads.", 5000); }
+      d.done++; renderSoon();
+    }
+  };
+  await Promise.all([work(), work(), work()]);
+  D.delete(id); render();
+  if (!d.stop) toast(d.failed ? `Downloaded ${d.done - d.failed}. ${d.failed} can only stream - add an audio file for those.` : `Downloaded ${d.done} songs`, 4000);
+}
+
+/* ---------- rate mode ---------- */
+const R = {keys: [], i: 0};
+function openRate(keys, startKey) {
+  if (!keys.length) return toast("No songs here.");
+  R.keys = keys;
+  R.i = startKey != null ? Math.max(keys.indexOf(startKey), 0) : Math.max(keys.findIndex(k => song(k).score == null), 0);
+  openLayer("rate"); drawRate(true);
+}
+function drawRate(play) {
+  const k = R.keys[R.i], s = song(k);
+  $("rCount").textContent = `${R.i + 1} / ${R.keys.length}`;
+  $("rBody").innerHTML = `${img(s, "rcover")}
+    <div class="ptitle">${esc(s.songName)}</div><div class="psub">${esc(subOf(s))}</div>
+    <div class="psub">${esc([s.songType, s.vintage].filter(Boolean).join(" · "))}</div>
+    ${canPlay(k) ? `<div class="rplay" style="margin-top:16px"><button class="icon big" id="rPlay" style="width:52px;height:52px;font-size:20px"></button>
+        <input type="range" id="rSeek" min="0" max="1000" value="0"><span class="sub" id="rTime">0:00</span></div>`
+      : `<div class="rnote">Not downloaded. <button class="btn" id="rFile" style="margin-top:8px">&#127925; Add an audio file</button></div>`}
+    <div class="rform"><label for="rScore">Your score</label>
+      <input id="rScore" inputmode="decimal" placeholder="0 - 10" autocomplete="off" value="${esc(fmtScore(s.score))}">
+      <div class="err" id="rErr"></div>
+      <label for="rNote">Note</label><textarea id="rNote" placeholder="Optional">${esc(s.note || "")}</textarea>
+      <div class="rbtns"><button class="btn" id="rPrev" ${R.i ? "" : "disabled"}>&#8249; Back</button>
+        <button class="btn primary" id="rNext">${R.i < R.keys.length - 1 ? "Next &#8250;" : "Done"}</button></div></div>`;
+  if (play && canPlay(k)) { P.queue = [k]; P.i = 0; P.single = true; P.order = null; load(true); }
+  else if (play) A.pause();
+  drawPlayState();
+}
+async function saveRate() {
+  const s = song(R.keys[R.i]), raw = $("rScore").value.trim().replace(",", "."), note = $("rNote").value.trim();
+  let score = s.score;
+  if (raw === "") score = null;
+  else { const n = Number(raw); if (!isFinite(n) || n < 0 || n > 10) { $("rErr").textContent = "Type a score from 0 to 10, like 8.5"; return false; } score = Math.round(n * 100) / 100; }
+  if (score !== s.score || note !== (s.note || "")) { s.score = score; s.note = note; s.changed = now(); await putSong(s); badge(); }
+  return true;
+}
+$("rBody").addEventListener("click", async e => {
+  const t = e.target.closest("button"); if (!t) return;
+  if (t.id === "rPlay") toggle();
+  else if (t.id === "rFile") { audioFor = R.keys[R.i]; $("audioFile").click(); }
+  else if (t.id === "rNext" || t.id === "rPrev") {
+    if (!(await saveRate())) return;
+    if (t.id === "rPrev") { R.i--; return drawRate(true); }
+    if (R.i < R.keys.length - 1) { R.i++; drawRate(true); } else { toast("All rated - nice"); back(); }
+  }
+});
+$("rBody").addEventListener("keydown", e => { if (e.key === "Enter" && e.target.id === "rScore") { e.preventDefault(); $("rNext").click(); } });
+
+/* ---------- sync ---------- */
+$("importFile").onchange = async e => {
+  const f = e.target.files[0]; e.target.value = ""; if (!f) return;
+  let data; try { data = JSON.parse(await f.text()); } catch (err) { return toast("That file isn't from the PC app."); }
+  if (!data || data.format !== "nick-anisong-phone" || !Array.isArray(data.songs)) {
+    return toast(data && data.format === "nick-anisong-phone-scores" ? "That's a file for the PC - open it there with Import." : "That file isn't from the PC app's Send to phone.", 4000);
+  }
+  let kept = 0;
+  for (const p of data.songs) {
+    if (!p || !p.key) continue;
+    const old = song(p.key), s = {...(old || {}), ...p, score: p.score ?? null, note: p.note || ""};
+    delete s.updated;
+    if (old && old.changed && old.changed > (p.updated || 0)) { s.score = old.score; s.note = old.note; s.changed = old.changed; kept++; }  // your phone change is newer
+    else s.changed = 0;
+    s.own = old ? old.own : false; S.songs.set(s.key, s); await putSong(s);
+  }
+  const fresh = [];
+  for (const p of data.playlists || []) {
+    const l = {id: p.id, name: p.name, all: !!p.all, items: p.songs || [], orderChanged: 0};
+    const i = S.lists.findIndex(x => x.id === l.id); if (i >= 0) S.lists[i] = l; else S.lists.push(l);
+    await putList(l); fresh.push(l.id);
+  }
+  S.lists.sort((a, b) => (b.all - a.all) || a.name.localeCompare(b.name));
+  S.tab = "lists"; S.list = null; render(); badge();
+  toast(`Imported ${fresh.length} playlist${fresh.length === 1 ? "" : "s"}` + (kept ? ` · kept ${kept} newer phone scores` : "") + (navigator.onLine ? " - downloading songs…" : ""), 4000);
+  [...S.songs.values()].forEach(fetchCover);
+  if (navigator.onLine) for (const id of fresh) await downloadList(id);
+};
+async function exportScores() {
+  const songs = [...S.songs.values()].filter(s => s.changed).map(s => ({key: s.key, score: s.score, note: s.note || "", changed: s.changed}));
+  const orders = S.lists.filter(l => l.orderChanged).map(l => ({id: l.id, keys: ranked(l)}));
+  if (!songs.length && !orders.length) return toast("You haven't rated anything on the phone yet.");
+  const stamp = new Date().toISOString().slice(0, 16).replace("T", " ").replace(":", "");
+  const file = new File([JSON.stringify({format: "nick-anisong-phone-scores", version: 1, exported: now(), songs, orders})],
+                        `AniSong phone scores ${stamp}.json`, {type: "application/json"});
+  try {
+    if (navigator.canShare && navigator.canShare({files: [file]})) await navigator.share({files: [file], title: "AniSong scores"});
+    else { const a = document.createElement("a"); a.href = URL.createObjectURL(file); a.download = file.name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000); }
+  } catch (err) { if (err.name === "AbortError") return; toast("Couldn't share it - try again."); return; }
+  S.lastExport = now(); store("lastExport", S.lastExport); badge(); render();
+  toast("Open that file in the PC app with Import.", 4000);
+}
+
+/* ---------- taps ---------- */
+$("tabs").onclick = e => {
+  const b = e.target.closest("[data-tab]"); if (!b) return;
+  if (S.list != null) { S.list = null; history.back(); }
+  S.tab = b.dataset.tab; S.list = null; render(); window.scrollTo(0, 0);
+};
+$("back").onclick = back;
+$("view").addEventListener("click", async e => {
+  const t = e.target;
+  const play = t.closest("[data-play]"); if (play) return playQueue(CTX[play.dataset.play] || [], 0, !!play.dataset.shuffle);
+  const dir = t.closest("[data-dir]"); if (dir) { S.rankDir = dir.dataset.dir; return render(); }
+  const card = t.closest("[data-list]"); if (card) { S.list = +card.dataset.list; history.pushState({layer: "list"}, ""); render(); return window.scrollTo(0, 0); }
+  const row = t.closest(".song");
+  if (row) {
+    const k = row.dataset.key;
+    if (t.closest("[data-more]")) return songMenu(k);
+    const nudge = t.closest("[data-nudge]"); if (nudge) return nudgeSong(k, +nudge.dataset.nudge);
+    const ctx = CTX[row.dataset.ctx] || [k], playable = ctx.filter(canPlay);
+    if (!canPlay(k)) return songMenu(k);
+    return playQueue(playable, playable.indexOf(k));
+  }
+  const id = t.closest("button") && t.closest("button").id;
+  if (id === "importBtn") $("importFile").click();
+  else if (id === "exportBtn") exportScores();
+  else if (id === "installBtn") { installPrompt.prompt(); installPrompt = null; render(); }
+  else if (id === "dlAll") { for (const l of S.lists) await downloadList(l.id); }
+  else if (id === "rateBtn") openRate(ranked(listById(S.list)));
+  else if (id === "dlList") downloadList(S.list);
+  else if (id === "dlStop") { const d = D.get(S.list); if (d) d.stop = true; }
+  else if (id === "listMore") listMenu(S.list);
+});
+$("view").addEventListener("input", e => { if (e.target.id === "q") { S.q = e.target.value; render.focus = true; render(); render.focus = false; } });
+$("view").addEventListener("change", e => {
+  if (e.target.id === "rankScope") { S.rankScope = e.target.value; render(); }
+  if (e.target.id === "rankMin") { S.rankMin = +e.target.value; render(); }
+});
+async function nudgeSong(k, step) {
+  const l = listById(S.list), keys = ranked(l), i = keys.indexOf(k), j = i + step;
+  if (j < 0 || j >= keys.length || song(keys[j]).score !== song(k).score) return;
+  [keys[i], keys[j]] = [keys[j], keys[i]];
+  l.items = keys.map((key, n) => [key, n]).concat(l.items.filter(([key]) => !S.songs.has(key)));
+  l.orderChanged = now(); await putList(l); badge(); render();
+}
+function listMenu(id) {
+  const l = listById(id), got = l.items.filter(([k]) => S.have.has(k)).length;
+  menu(`<div class="mhead"><div class="meta"><div class="t">${esc(l.name)}</div><div class="s">${l.items.length} songs</div></div></div>
+    ${got ? `<button class="mi danger" data-act="undl">&#128465; Remove ${got} downloads</button>` : ""}
+    <button class="mi danger" data-act="drop">&#10005; Remove playlist from phone</button>`);
+  $("menu").onclick = async e => {
+    const a = e.target.closest("[data-act]"); if (!a) return;
+    const act = a.dataset.act; back();
+    const keys = l.items.map(([k]) => k);
+    if (act === "undl") {
+      if (!confirm(`Remove ${got} downloaded songs? Songs that are also in other playlists lose their download too.`)) return;
+      await delBlobs(keys.map(k => "a:" + k)); keys.forEach(k => { S.have.delete(k); const s = song(k); if (s) { s.own = false; putSong(s); } }); render();
+    } else if (act === "drop") {
+      if (!confirm(`Remove "${l.name}" from this phone? Your PC keeps it.`)) return;
+      S.lists = S.lists.filter(x => x.id !== id); await tx("lists", "readwrite", st => st.delete(id));
+      const still = new Set(S.lists.flatMap(x => x.items.map(([k]) => k)));
+      const gone = keys.filter(k => !still.has(k) && !(song(k) && song(k).changed > S.lastExport));  // keep unsent scores
+      await delBlobs(gone.map(k => "a:" + k)); await tx("songs", "readwrite", st => gone.forEach(k => st.delete(k)));
+      gone.forEach(k => { S.have.delete(k); S.songs.delete(k); }); S.list = null; render();
+    }
+  };
+}
+
+$("miniOpen").onclick = $("miniCover").onclick = () => { $("pQueue").hidden = true; $("pMain").hidden = false; $("pQueueBtn").classList.remove("on"); openLayer("player"); drawPlayer(); };
+$("miniPlay").onclick = $("pPlay").onclick = toggle;
+$("miniNext").onclick = $("pNext").onclick = () => next(false);
+$("pPrev").onclick = prev;
+$("pShuffle").onclick = () => setShuffle(!P.shuffle);
+$("pRepeat").onclick = () => { P.repeat = {off: "all", all: "one", one: "off"}[P.repeat]; drawPlayer(); toast({all: "Repeat all", one: "Repeat this song", off: "Repeat off"}[P.repeat]); };
+$("pQueueBtn").onclick = () => { const q = $("pQueue").hidden; $("pQueue").hidden = !q; $("pMain").hidden = q; $("pQueueBtn").classList.toggle("on", q); if (q) drawQueue(); };
+$("pSleep").onclick = () => {
+  menu(`<div class="mhead"><div class="meta"><div class="t">Sleep timer</div></div></div>` +
+       [[0, "Off"], [15, "15 minutes"], [30, "30 minutes"], [60, "1 hour"], ["end", "End of this song"]].map(([v, n]) =>
+         `<button class="mi" data-sleep="${v}">${n}</button>`).join(""));
+  $("menu").onclick = e => { const b = e.target.closest("[data-sleep]"); if (!b) return; back(); setSleep(b.dataset.sleep === "end" ? "end" : +b.dataset.sleep); };
+};
+$("player").addEventListener("click", e => {
+  if (e.target.closest("[data-back]")) return back();
+  const del = e.target.closest("[data-qdel]");
+  if (del) { P.queue.splice(+del.dataset.qdel, 1); return drawQueue(); }
+  const row = e.target.closest(".song"); if (!row) return;
+  if (e.target.closest("[data-more]")) return songMenu(row.dataset.key);
+  const i = P.queue.indexOf(row.dataset.key, P.i); if (i > P.i) { P.i = i; load(true); }
+});
+$("rate").addEventListener("click", e => { if (e.target.closest("[data-back]")) back(); });
+let seeking = false;
+for (const id of ["pSeek", "rSeek"]) document.addEventListener("input", e => { if (e.target.id === id) seeking = true; });
+document.addEventListener("change", e => {
+  if (e.target.id === "pSeek" || e.target.id === "rSeek") { if (A.duration) A.currentTime = A.duration * e.target.value / 1000; seeking = false; }
+});
+window.addEventListener("online", renderSoon); window.addEventListener("offline", renderSoon);
+
+let installPrompt = null;
+window.addEventListener("beforeinstallprompt", e => { e.preventDefault(); installPrompt = e; if (S.tab === "sync") render(); });
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+boot().catch(err => { $("view").innerHTML = `<div class="empty"><b>Couldn't open the app's storage</b>${esc(err && err.message)}</div>`; });

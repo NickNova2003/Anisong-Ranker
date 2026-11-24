@@ -250,6 +250,8 @@ $("importFile").onchange = async e => {
 async function importPlaylistFile(file) {
   let body;
   try { body = JSON.parse(await file.text()); } catch (err) { return toast("That file isn't a playlist from this app."); }
+  if (body && body.format === "nick-anisong-phone-scores") return importPhoneScores(body);
+  if (body && body.format === "nick-anisong-phone") return toast("That's the file for your phone - open it in the phone app.");
   try {
     const d = await api("/api/playlists/import", {method: "POST", body});
     toast(`Imported "${d.name}" (${d.added} songs)`); await loadLibrary(); openPlaylist(d.id);
@@ -1108,6 +1110,38 @@ $("combineForm").onsubmit = async e => {
     await loadLibrary(); openPlaylist(d.id);
   } catch (err) { $("combineErr").textContent = err.message; }
 };
+
+/* ---------- phone companion ---------- */
+function phoneCount() {
+  const n = $("phoneFrom").querySelectorAll("input:checked").length;
+  $("phonePicked").textContent = n ? `${n} picked` : "None picked";
+}
+$("phonePl").onclick = () => {
+  const lists = state.playlists.filter(p => p.kind !== "friend");
+  $("phoneFrom").innerHTML = lists.map(p => `<label class="pickitem">
+      <input type="checkbox" class="chkbox" value="${p.id}" ${p.kind !== "all" ? "checked" : ""}>
+      <span class="pname">${p.kind === "all" ? "&#9733; " : ""}${esc(p.name)}</span><span class="pcount">${p.count}</span></label>`).join("");
+  $("phoneErr").textContent = ""; phoneCount(); $("phoneDlg").showModal();
+};
+$("phoneFrom").addEventListener("change", phoneCount);
+$("phoneAll").onclick = () => {
+  const boxes = [...$("phoneFrom").querySelectorAll("input")], on = !boxes.every(b => b.checked);
+  boxes.forEach(b => b.checked = on); phoneCount();
+};
+$("phoneForm").onsubmit = e => {
+  e.preventDefault();
+  const ids = [...$("phoneFrom").querySelectorAll("input:checked")].map(c => c.value);
+  if (!ids.length) return $("phoneErr").textContent = "Pick at least one playlist.";
+  location.href = "/api/phone/export?ids=" + ids.join(",");
+  $("phoneDlg").close(); toast("Saved - send that file to your phone and open it with Import.");
+};
+async function importPhoneScores(body) {
+  try {
+    const d = await api("/api/phone/import", {method: "POST", body});
+    toast(`Phone scores: ${d.took} updated` + (d.older ? `, ${d.older} already up to date` : "") + (d.gone ? `, ${d.gone} songs no longer here` : ""));
+    await loadLibrary(); await loadPlaylists(); if (state.current != null) openPlaylist(state.current);
+  } catch (err) { toast(err.message); }
+}
 
 /* ---------- top 10 image ---------- */
 function loadImage(url) {

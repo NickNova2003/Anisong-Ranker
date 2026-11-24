@@ -19,6 +19,7 @@
     <div class="side-actions">
       <button class="btn wide" id="newPl">+ New playlist</button>
       <button class="btn wide" id="combinePl">&#10753; Combine playlists</button>
+      <button class="btn wide" id="phonePl">&#128241; Send to phone</button>
       <button class="btn wide" id="importPl">&#8679; Import</button>
       <input type="file" id="importFile" accept=".json,.csv,.tsv,.txt,.xlsx,.xlsm" hidden>
     </div>
@@ -206,6 +207,21 @@
     <div class="row" style="justify-content:flex-end;margin-top:18px">
       <button class="btn" type="button" data-close>Cancel</button>
       <button class="btn primary" type="submit">Add</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="phoneDlg">
+  <form id="phoneForm" method="dialog">
+    <h3>Send to phone</h3>
+    <div class="sub">Saves a small file with these playlists and your scores. Open it in the phone app with <b>Import</b>, and it downloads the songs itself. To bring phone scores back, use <b>Import</b> here with the file the phone exports.</div>
+    <div class="field"><div class="row" style="margin-bottom:7px"><div class="label" style="margin:0">Playlists</div>
+      <span class="grow"></span><span class="sub" id="phonePicked"></span><button class="btn sm" type="button" id="phoneAll">Select all</button></div>
+      <div class="picklist" id="phoneFrom"></div></div>
+    <div class="status err" id="phoneErr" style="margin-top:10px"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:18px">
+      <button class="btn" type="button" data-close>Cancel</button>
+      <button class="btn primary" type="submit">Save file</button>
     </div>
   </form>
 </dialog>

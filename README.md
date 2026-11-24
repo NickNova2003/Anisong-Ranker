@@ -52,6 +52,30 @@ Then open http://127.0.0.1:5000 (the launchers open it for you).
 AniSongDB switches off song and artist name searches while AMQ ranked games are on (a few short
 windows a day). Season searches, artist/anime clicks and imports by anime still work then.
 
+## Phone app
+
+`phone/` is an offline companion for Android: listen to your playlists and rate them with no
+internet (on a plane, say), then send the scores back. It's hosted free with GitHub Pages.
+
+**Set up once**
+1. On GitHub, open this repo → **Settings** → **Pages**.
+2. Under *Build and deployment*, set Source to **Deploy from a branch**, pick **main** and
+   **/ (root)**, and press **Save**.
+3. After a minute the page shows your site address. Your phone app is that address plus `phone/`,
+   e.g. `https://yourname.github.io/anisong-ranker/phone/`.
+4. Open it in Chrome on your phone, tap **⋮** → **Add to Home screen** (or **Install app**).
+
+**Using it**
+1. PC app: **Send to phone**, tick the playlists, save the file and send it to your phone
+   (WhatsApp, Drive, email).
+2. Phone app: **Sync** → **Import from PC**. Songs download over the internet straight away.
+3. Listen and rate anywhere. Custom songs (YouTube links) can't download, so use **⋮ → Add audio
+   file** on them to pick an MP3 from your phone.
+4. Phone app: **Sync** → **Send scores to PC**, then open that file in the PC app with **Import**.
+   If a song was changed on both, the newer change wins.
+
+Your scores and songs stay on your phone. Nothing is uploaded anywhere.
+
 ## Thanks
 
 All song data belongs to AniSongDB, AnimeThemes, MyAnimeList and AniList, and the songs to their
