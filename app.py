@@ -64,6 +64,8 @@ def init_db():
                 score REAL, note TEXT DEFAULT '', added REAL NOT NULL,
                 PRIMARY KEY (playlist_id, song_key));
             CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, fetched REAL NOT NULL, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                                                parent INTEGER, created REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS anime_meta (
                 key TEXT PRIMARY KEY, fetched REAL NOT NULL, found INTEGER NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS names (
@@ -77,6 +79,8 @@ def init_db():
             con.execute("ALTER TABLE playlists ADD COLUMN kind TEXT NOT NULL DEFAULT 'own'")
         if "pinned" not in columns(con, "playlists"):
             con.execute("ALTER TABLE playlists ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        if "folder" not in columns(con, "playlists"):
+            con.execute("ALTER TABLE playlists ADD COLUMN folder INTEGER")
         if "pos" not in columns(con, "playlist_songs"):
             con.execute("ALTER TABLE playlist_songs ADD COLUMN pos REAL")
             con.execute("UPDATE playlist_songs SET pos = added")
@@ -144,6 +148,11 @@ def save_song(con, song):
 def playlist_info(con, pid):
     if pid == ALL_ID:
         return {"id": ALL_ID, "name": ALL_NAME, "kind": "all", "pinned": True}
+    if pid < 0:  # folders show up as read-only playlists with negative ids
+        row = con.execute("SELECT name FROM folders WHERE id=?", (-pid,)).fetchone()
+        if not row:
+            abort(404)
+        return {"id": pid, "name": row["name"], "kind": "folder", "pinned": False}
     row = con.execute("SELECT id, name, kind, pinned FROM playlists WHERE id=?", (pid,)).fetchone()
     if not row:
         abort(404)
@@ -165,6 +174,8 @@ def playlist_rows(con, pid):
     """Songs with score/note filled in. In a friend's playlist those are theirs, and yours sit in mine/myNote."""
     if pid == ALL_ID:
         return all_rows(con)
+    if pid < 0:
+        return folder_rows(con, -pid)
     friend = playlist_info(con, pid)["kind"] == "friend"
     rows = con.execute(
         """SELECT s.data, ps.score AS theirs, ps.note AS their_note, ps.added, COALESCE(ps.pos, ps.added) AS pos,
@@ -191,7 +202,58 @@ def all_rows(con):
                      added=r["added"] or 0, pos=r["pos"] if r["pos"] is not None else (r["added"] or 0)) for r in rows]
 
 
+def subfolders(con, fid):
+    """This folder and every folder inside it."""
+    ids, todo = set(), [fid]
+    while todo:
+        f = todo.pop()
+        if f not in ids:
+            ids.add(f)
+            todo += [r[0] for r in con.execute("SELECT id FROM folders WHERE parent=?", (f,))]
+    return ids
+
+
+def folder_keys(con, fid):
+    ids = ",".join(str(i) for i in subfolders(con, fid))
+    return f"""SELECT ps.song_key AS key, MIN(ps.added) AS added FROM playlist_songs ps
+               JOIN playlists p ON p.id = ps.playlist_id WHERE p.kind = 'own' AND p.folder IN ({ids}) GROUP BY ps.song_key"""
+
+
+def folder_rows(con, fid):
+    rows = con.execute(f"""SELECT s.data, r.score, r.note, k.added, COALESCE(r.pos, k.added) AS pos
+                           FROM ({folder_keys(con, fid)}) k JOIN songs s ON s.key = k.key
+                           LEFT JOIN ratings r ON r.song_key = k.key""").fetchall()
+    return [song_out(r["data"], score=r["score"], note=r["note"] or "", mine=r["score"], myNote=r["note"] or "",
+                     added=r["added"], pos=r["pos"]) for r in rows]
+
+
+def folder_path(con, fid):
+    names = []
+    while fid and len(names) < 50:
+        row = con.execute("SELECT name, parent FROM folders WHERE id=?", (fid,)).fetchone()
+        if not row:
+            break
+        names.append(row["name"])
+        fid = row["parent"]
+    return " / ".join(reversed(names))
+
+
+SEASON_NAME = re.compile(r"^(winter|spring|summer|fall|autumn)\s+(\d{4})$", re.I)
+
+
+def year_folder(con, name):
+    """"Summer 2026" goes into a top-level "2026" folder, made if needed. None for other names."""
+    m = SEASON_NAME.match(name.strip())
+    if not m:
+        return None
+    row = con.execute("SELECT id FROM folders WHERE name=? AND parent IS NULL", (m.group(2),)).fetchone()
+    return row["id"] if row else con.execute("INSERT INTO folders(name, parent, created) VALUES (?,NULL,?)",
+                                             (m.group(2), time.time())).lastrowid
+
+
 def in_playlist(con, pid, key):
+    if pid < 0:
+        return con.execute(f"SELECT 1 FROM ({folder_keys(con, -pid)}) WHERE key=?", (key,)).fetchone() is not None
     if pid == ALL_ID:
         return con.execute(ALL_KEYS + " SELECT 1 FROM keys WHERE key=?", (key,)).fetchone() is not None
     return con.execute("SELECT 1 FROM playlist_songs WHERE playlist_id=? AND song_key=?", (pid, key)).fetchone() is not None
@@ -223,6 +285,8 @@ def own_playlist(con, pid, action):
         raise UserError(f"All songs fills itself in, so you can't {action} there.")
     if info["kind"] == "friend":
         raise UserError(f"That's a friend's playlist, so you can't {action} there.")
+    if info["kind"] == "folder":
+        raise UserError(f"A folder fills itself from its playlists, so you can't {action} there.")
     return info
 
 
@@ -598,7 +662,7 @@ def library():
 def list_playlists():
     with db() as con:
         rows = con.execute(
-            """SELECT p.id, p.name, p.pinned, p.kind, COUNT(ps.song_key) AS count,
+            """SELECT p.id, p.name, p.pinned, p.kind, -p.folder AS folder, COUNT(ps.song_key) AS count,
                       SUM(CASE WHEN p.kind = 'friend' THEN ps.score ELSE r.score END IS NOT NULL) AS rated,
                       ROUND(AVG(CASE WHEN p.kind = 'friend' THEN ps.score ELSE r.score END), 2) AS average
                FROM playlists p LEFT JOIN playlist_songs ps ON ps.playlist_id = p.id
@@ -607,9 +671,15 @@ def list_playlists():
         everything = con.execute(ALL_KEYS + """
             SELECT COUNT(*) AS count, COUNT(r.score) AS rated, ROUND(AVG(r.score), 2) AS average
             FROM keys k JOIN songs s ON s.key = k.key LEFT JOIN ratings r ON r.song_key = k.key""").fetchone()
+        folders = []
+        for f in con.execute("SELECT id, name, parent FROM folders ORDER BY name COLLATE NOCASE").fetchall():
+            n = con.execute(f"""SELECT COUNT(*) AS count, COUNT(r.score) AS rated, ROUND(AVG(r.score), 2) AS average
+                                FROM ({folder_keys(con, f["id"])}) k LEFT JOIN ratings r ON r.song_key = k.key""").fetchone()
+            folders.append({"id": -f["id"], "name": f["name"], "kind": "folder", "pinned": 0,
+                            "folder": -f["parent"] if f["parent"] else None, **dict(n)})
     first = {"id": ALL_ID, "name": ALL_NAME, "pinned": 1, "kind": "all", "count": everything["count"],
-             "rated": everything["rated"] or 0, "average": everything["average"]}
-    return jsonify([first] + [dict(r) | {"rated": r["rated"] or 0} for r in rows])
+             "rated": everything["rated"] or 0, "average": everything["average"], "folder": None}
+    return jsonify([first] + folders + [dict(r) | {"rated": r["rated"] or 0} for r in rows])
 
 
 def check_name(con, name, pid=None):
@@ -627,11 +697,11 @@ def check_name(con, name, pid=None):
 def create_playlist():
     with db() as con:
         name = check_name(con, (request.get_json(force=True) or {}).get("name"))
-        cur = con.execute("INSERT INTO playlists(name, created) VALUES (?,?)", (name, time.time()))
+        cur = con.execute("INSERT INTO playlists(name, created, folder) VALUES (?,?,?)", (name, time.time(), year_folder(con, name)))
         return jsonify(id=cur.lastrowid, name=name)
 
 
-@app.get("/api/playlists/<int:pid>")
+@app.get("/api/playlists/<int(signed=True):pid>")
 def get_playlist(pid):
     with db() as con:
         info = playlist_info(con, pid)
@@ -641,30 +711,91 @@ def get_playlist(pid):
                    songs=songs, artPending=waiting)
 
 
-@app.patch("/api/playlists/<int:pid>")
+@app.patch("/api/playlists/<int(signed=True):pid>")
 def update_playlist(pid):
     body = request.get_json(force=True) or {}
     if pid == ALL_ID:
         raise UserError(f"{ALL_NAME} is built for you, so it can't be renamed or pinned.")
+    if pid < 0:
+        return update_folder(-pid)
     with db() as con:
         playlist_info(con, pid)
         if "pinned" in body:
             con.execute("UPDATE playlists SET pinned=? WHERE id=?", (int(bool(body["pinned"])), pid))
         if "name" in body:
-            con.execute("UPDATE playlists SET name=? WHERE id=?", (check_name(con, body.get("name"), pid), pid))
+            name = check_name(con, body.get("name"), pid)
+            con.execute("UPDATE playlists SET name=? WHERE id=?", (name, pid))
+            if "folder" not in body and con.execute("SELECT folder FROM playlists WHERE id=?", (pid,)).fetchone()[0] is None:
+                con.execute("UPDATE playlists SET folder=? WHERE id=?", (year_folder(con, name), pid))
+        if "folder" in body:
+            con.execute("UPDATE playlists SET folder=? WHERE id=?", (folder_id(con, body["folder"]), pid))
     return jsonify(ok=True)
 
 
-@app.delete("/api/playlists/<int:pid>")
+@app.delete("/api/playlists/<int(signed=True):pid>")
 def delete_playlist(pid):
     if pid == ALL_ID:
         raise UserError(f"{ALL_NAME} can't be deleted.")
+    if pid < 0:
+        return delete_folder(-pid)
     with db() as con:
         con.execute("DELETE FROM playlists WHERE id=?", (pid,))
     return jsonify(ok=True)
 
 
-@app.post("/api/playlists/<int:pid>/songs")
+# ------------------------------------------------------------------- folders
+def folder_id(con, value):
+    """A folder id from the browser (negative, like the list uses) or None for top level."""
+    if value in (None, "", 0):
+        return None
+    fid = abs(int(value))
+    if not con.execute("SELECT 1 FROM folders WHERE id=?", (fid,)).fetchone():
+        raise UserError("That folder doesn't exist any more.")
+    return fid
+
+
+@app.post("/api/folders")
+def create_folder():
+    body = request.get_json(force=True) or {}
+    name = str(body.get("name") or "").strip()[:120]
+    if not name:
+        raise UserError("Give the folder a name.")
+    with db() as con:
+        cur = con.execute("INSERT INTO folders(name, parent, created) VALUES (?,?,?)",
+                          (name, folder_id(con, body.get("parent")), time.time()))
+    return jsonify(id=-cur.lastrowid, name=name)
+
+
+def update_folder(fid):
+    body = request.get_json(force=True) or {}
+    with db() as con:
+        playlist_info(con, -fid)
+        if "name" in body:
+            name = str(body.get("name") or "").strip()[:120]
+            if not name:
+                raise UserError("Give the folder a name.")
+            con.execute("UPDATE folders SET name=? WHERE id=?", (name, fid))
+        if "folder" in body:
+            parent = folder_id(con, body["folder"])
+            if parent is not None and parent in subfolders(con, fid):
+                raise UserError("A folder can't go inside itself.")
+            con.execute("UPDATE folders SET parent=? WHERE id=?", (parent, fid))
+    return jsonify(ok=True)
+
+
+def delete_folder(fid):
+    """Removes just the folder: what was inside moves up a level."""
+    with db() as con:
+        row = con.execute("SELECT parent FROM folders WHERE id=?", (fid,)).fetchone()
+        if not row:
+            abort(404)
+        con.execute("UPDATE folders SET parent=? WHERE parent=?", (row["parent"], fid))
+        con.execute("UPDATE playlists SET folder=? WHERE folder=?", (row["parent"], fid))
+        con.execute("DELETE FROM folders WHERE id=?", (fid,))
+    return jsonify(ok=True)
+
+
+@app.post("/api/playlists/<int(signed=True):pid>/songs")
 def add_songs(pid):
     songs = (request.get_json(force=True) or {}).get("songs") or []
     added = rated = 0
@@ -684,12 +815,12 @@ def add_songs(pid):
     return jsonify(added=added, skipped=len(songs) - added, carried=rated)
 
 
-@app.post("/api/playlists/<int:pid>/remove")
+@app.post("/api/playlists/<int(signed=True):pid>/remove")
 def remove_songs(pid):
     return jsonify(removed=drop(pid, [str(k) for k in (request.get_json(force=True) or {}).get("keys") or []][:5000]))
 
 
-@app.delete("/api/playlists/<int:pid>/songs/<key>")
+@app.delete("/api/playlists/<int(signed=True):pid>/songs/<key>")
 def remove_song(pid, key):
     drop(pid, [key])
     return jsonify(ok=True)
@@ -698,6 +829,8 @@ def remove_song(pid, key):
 def drop(pid, keys):
     if pid == ALL_ID:
         raise UserError(f"Nothing can be removed from {ALL_NAME}. Remove songs from their own playlists instead.")
+    if pid < 0:
+        raise UserError("Nothing can be removed from a folder. Remove songs from their own playlists instead.")
     with db() as con:
         playlist_info(con, pid)
         return sum(con.execute("DELETE FROM playlist_songs WHERE playlist_id=? AND song_key=?", (pid, k)).rowcount
@@ -713,7 +846,7 @@ def parse_score(score):
     return round(score, 2)
 
 
-@app.patch("/api/playlists/<int:pid>/songs/<key>")
+@app.patch("/api/playlists/<int(signed=True):pid>/songs/<key>")
 def update_song(pid, key):
     """Scores and notes are yours and shared by every playlist (and All songs)."""
     body = request.get_json(force=True) or {}
@@ -732,7 +865,7 @@ def update_song(pid, key):
     return jsonify(ok=True)
 
 
-@app.post("/api/playlists/<int:pid>/songs/<key>/move")
+@app.post("/api/playlists/<int(signed=True):pid>/songs/<key>/move")
 def move_song(pid, key):
     """Nudge a song past another one with the same score."""
     try:
@@ -746,9 +879,11 @@ def move_song(pid, key):
         row = con.execute("SELECT score FROM ratings WHERE song_key=?", (key,)).fetchone()
         if not row or row["score"] is None or not in_playlist(con, pid, key):
             raise UserError("Only rated songs can be moved.")
-        if pid == ALL_ID:
+        if pid <= 0:
             group = con.execute("""SELECT song_key, COALESCE(pos, updated) AS pos FROM ratings WHERE score=?
                                    ORDER BY COALESCE(pos, updated), song_key""", (row["score"],)).fetchall()
+            if pid < 0:
+                group = [g for g in group if in_playlist(con, pid, g["song_key"])]
             write = "UPDATE ratings SET pos=? WHERE song_key=?"
         else:
             group = con.execute("""SELECT ps.song_key, COALESCE(ps.pos, ps.added) AS pos FROM playlist_songs ps
@@ -800,7 +935,7 @@ def clean_link(value):
     return None
 
 
-@app.post("/api/playlists/<int:pid>/custom")
+@app.post("/api/playlists/<int(signed=True):pid>/custom")
 def add_custom(pid):
     body = request.get_json(force=True) or {}
     name = str(body.get("name") or "").strip()[:300]
@@ -917,13 +1052,22 @@ def stats():
     pid = request.args.get("playlist", type=int)
     with db() as con:
         entries = playlist_rows(con, pid if pid else ALL_ID)
-        lists = con.execute("""SELECT p.name, ROUND(AVG(r.score), 2) AS average, COUNT(r.score) AS count
-                               FROM playlists p JOIN playlist_songs ps ON ps.playlist_id = p.id
-                               JOIN ratings r ON r.song_key = ps.song_key AND r.score IS NOT NULL
-                               WHERE p.kind = 'own' GROUP BY p.id""").fetchall()
+        avg = """SELECT ROUND(AVG(r.score), 2) AS average, COUNT(r.score) AS count FROM ({}) k
+                 JOIN ratings r ON r.song_key = k.key AND r.score IS NOT NULL"""
+        if pid and pid < 0:  # a folder: compare what's directly inside it (seasons in a year, say)
+            lists = [{"name": "\U0001F4C1 " + f["name"], **dict(con.execute(avg.format(folder_keys(con, f["id"]))).fetchone())}
+                     for f in con.execute("SELECT id, name FROM folders WHERE parent=?", (-pid,)).fetchall()]
+            lists += [{"name": p["name"], **dict(con.execute(avg.format("SELECT song_key AS key FROM playlist_songs WHERE playlist_id=%d" % p["id"])).fetchone())}
+                      for p in con.execute("SELECT id, name FROM playlists WHERE folder=? AND kind='own'", (-pid,)).fetchall()]
+            lists = [x for x in lists if x["count"]]
+        else:
+            lists = con.execute("""SELECT p.name, ROUND(AVG(r.score), 2) AS average, COUNT(r.score) AS count
+                                   FROM playlists p JOIN playlist_songs ps ON ps.playlist_id = p.id
+                                   JOIN ratings r ON r.song_key = ps.song_key AND r.score IS NOT NULL
+                                   WHERE p.kind = 'own' GROUP BY p.id""").fetchall()
         count = con.execute("SELECT COUNT(*) FROM playlists WHERE kind='own'").fetchone()[0]
     enrich(entries, max_batches=3)
-    return jsonify(entries=entries, playlists=count, playlistAverages=[dict(r) for r in lists])
+    return jsonify(entries=entries, playlists=count, playlistAverages=[dict(r) for r in lists], folder=bool(pid and pid < 0))
 
 
 # ------------------------------------------------------- spreadsheet import
@@ -937,6 +1081,12 @@ def sheet_read():
                 return jsonify(error="That file is over 20 MB."), 400
         else:
             body = request.get_json(force=True) or {}
+            if body.get("url") and re.search(r"youtu\.?be", body["url"]):
+                title, tracks = src.ytm_playlist(body["url"])
+                rows = [["Song", "Artist", "Anime", "Type", "Link"]] + [
+                    [*sheets.video_row(t["title"], t["artists"], t["album"]), src.youtube_link(t["videoId"])] for t in tracks]
+                return jsonify(name=title, sheets=[{"name": title, "rows": rows,
+                                                    "guess": {**sheets.guess(rows, title), "type": ""}}])
             if body.get("url"):
                 name, data = read_google_sheet(body["url"])
             else:
@@ -1037,7 +1187,7 @@ def run_autopick(job, items):
 def sheet_match():
     body = request.get_json(force=True) or {}
     if isinstance(body.get("items"), list):  # retrying some rows from an earlier run
-        items = clean_items(body["items"][:5000], ("anime", "animeClean", "song", "artist", "season", "type"))
+        items = clean_items(body["items"][:5000], ("anime", "animeClean", "song", "artist", "season", "type", "link"))
         if not items:
             return jsonify(error="Nothing to retry."), 400
         return jsonify(job=start_job(run_sheet_match, items))
@@ -1136,6 +1286,34 @@ def run_sheet_match(job, items):
             pass
         job["done"] += 1
 
+    # 4. by artist: everything AniSongDB has from them, compared by title (catches "Song (TV Size)" style names)
+    left = [it for it in todo if not it["match"] and it["artist"]]
+    artists = list(dict.fromkeys(it["artist"] for it in left))[:150]
+    job.update(step="Searching by artist", total=len(artists), done=0)
+    for name in artists if not job["paused"] else []:
+        if job.get("cancel"):
+            return
+        try:
+            cands = [src.normalize(x) for x in src.anisongdb_text(name, ["artist"], True, flags)[:500]]
+            for it in left:
+                if it["artist"] == name:
+                    settle(it, cands)
+        except src.SearchPaused:
+            job["paused"] = True
+            break
+        except (requests.RequestException, ValueError):
+            pass
+        job["done"] += 1
+
+    # 5. songs that aren't anywhere: a YouTube link so they can still be played
+    left = [it for it in todo if not it["match"] and not it.get("link")][:300]
+    job.update(step="Finding YouTube links", total=len(left), done=0)
+    for it in left:
+        if job.get("cancel"):
+            return
+        it["link"] = src.ytm_find(f'{it["song"]} {it["artist"]}'.strip()) or ""
+        job["done"] += 1
+
     job.update(step="Loading covers", total=0)
     enrich([it["match"] for it in todo if it["match"]])
     for it in items:
@@ -1163,7 +1341,9 @@ def sheet_import():
             if isinstance(r.get("song"), dict) and r["song"].get("key") and r["song"].get("songName"):
                 song = r["song"]
             elif isinstance(r.get("custom"), dict) and str(r["custom"].get("name") or "").strip():
-                song = custom_song(r["custom"]["name"], r["custom"].get("artist"), r["custom"].get("anime"))
+                link = str(r["custom"].get("link") or "")
+                song = custom_song(r["custom"]["name"], r["custom"].get("artist"), r["custom"].get("anime"),
+                                   link if re.match(r"https?://", link) else None)
             else:
                 continue
             key = str(song["key"])
@@ -1197,7 +1377,7 @@ def attachment(body, mimetype, filename):
                     headers={"Content-Disposition": f'attachment; filename="{ascii_name(filename)}"'})
 
 
-@app.get("/api/playlists/<int:pid>/export.csv")
+@app.get("/api/playlists/<int(signed=True):pid>/export.csv")
 def export_csv(pid):
     with db() as con:
         name = get_playlist_name(con, pid)
@@ -1214,7 +1394,7 @@ def export_csv(pid):
     return attachment("﻿" + buf.getvalue(), "text/csv", safe_name(name) + ".csv")
 
 
-@app.get("/api/playlists/<int:pid>/export.json")
+@app.get("/api/playlists/<int(signed=True):pid>/export.json")
 def export_json(pid):
     with db() as con:
         name = get_playlist_name(con, pid)
@@ -1301,7 +1481,7 @@ def short_type(song_type):
     return re.sub(r"^Opening", "OP", re.sub(r"^Ending", "ED", re.sub(r"^Insert Song", "Insert", song_type or "")))
 
 
-@app.get("/api/playlists/<int:pid>/share.html")
+@app.get("/api/playlists/<int(signed=True):pid>/share.html")
 def share_page(pid):
     with db() as con:
         name = get_playlist_name(con, pid)
@@ -1431,7 +1611,7 @@ def run_download(job, pid, fmt):
     job["state"] = "finished"
 
 
-@app.post("/api/playlists/<int:pid>/download")
+@app.post("/api/playlists/<int(signed=True):pid>/download")
 def download_all(pid):
     fmt = (request.get_json(silent=True) or {}).get("format", "audio")
     with db() as con:
@@ -1563,7 +1743,10 @@ def phone_export():
                 songs[r["key"]] = {**{k: r.get(k) for k in PHONE_FIELDS}, "score": r["mine"], "note": r["myNote"],
                                    "updated": rated["updated"] if rated else 0, "audio": r.get("audio") or r.get("mq"),
                                    "cover": r.get("cover") or r.get("coverSmall")}
-            playlists.append({"id": pid, "name": info["name"], "all": pid == ALL_ID,
+            parent = con.execute("SELECT parent FROM folders WHERE id=?", (-pid,)).fetchone() if pid < 0 else \
+                con.execute("SELECT folder FROM playlists WHERE id=?", (pid,)).fetchone()
+            playlists.append({"id": pid, "name": info["name"], "all": pid == ALL_ID, "isFolder": pid < 0,
+                              "folder": folder_path(con, parent[0]) if parent and parent[0] else "",
                               "songs": [[r["key"], r["pos"]] for r in rows]})
     stamp = time.strftime("%Y-%m-%d %H%M")
     body = json.dumps({"format": "nick-anisong-phone", "version": 1, "exported": time.time(),

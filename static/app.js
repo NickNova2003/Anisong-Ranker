@@ -7,7 +7,7 @@ const S = view("s", {key: "anime", dir: 1});   // search results
 const P = view("p", {key: "rank", dir: 1});    // open playlist
 P.kind = "own";
 const ALL_ID = 0;
-const isFriend = () => P.kind === "friend", isAll = () => P.kind === "all";
+const isFriend = () => P.kind === "friend", isAll = () => P.kind === "all" || P.kind === "folder";  // folders are read-only like All songs
 const mineOf = s => isFriend() ? s.mine : s.score;  // your own score for a row
 const state = {playlists: [], current: null, library: {}, ffmpeg: false, season: "", year: 0, queue: [], qi: -1, busy: false,
                loadedSeason: "", video: false, focusKey: null};
@@ -39,7 +39,8 @@ const sourceOf = s => s.source || (s.custom ? "custom" : "anisongdb");
 const isNew = s => ["animethemes", "mal"].includes(sourceOf(s));
 const typeCode = t => /^op/i.test(t) ? "OP" : /^ed/i.test(t) ? "ED" : /^custom/i.test(t) ? "CU" : "IN";
 const shortType = t => (t || "").replace(/^Opening/, "OP").replace(/^Ending/, "ED").replace(/^Insert Song/, "Insert");
-const srcOf = s => s.audio || s.mq || s.hq;
+const ytId = s => { const m = /(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/)|youtu\.be\/)([\w-]{11})/.exec((s && s.link) || ""); return m ? m[1] : null; };
+const srcOf = s => s.audio || s.mq || s.hq || (ytId(s) ? "yt:" + ytId(s) : "");  // YouTube-only songs play through YouTube's player
 const fmtLen = n => n ? Math.floor(n / 60) + ":" + String(Math.round(n % 60)).padStart(2, "0") : "";
 const fmtScore = n => n == null ? "–" : String(+n.toFixed(2));
 const seasonNum = v => { const m = /(\w+)\s+(\d{4})/.exec(v || ""); return m ? +m[2] * 4 + (SEASON_NUM[m[1]] ?? 0) : 0; };
@@ -193,31 +194,94 @@ async function loadPlaylists() {
   const cur = state.playlists.find(p => p.id === state.current);
   if (cur) $("plPin").innerHTML = cur.pinned ? "&#128204; Unpin" : "&#128204; Pin";
   const scope = $("statsScope").value;
-  $("statsScope").innerHTML = `<option value="">All songs</option>` + ownLists().map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  $("statsScope").innerHTML = `<option value="">All songs</option>` + folderTree().map(([p, depth]) =>
+    `<option value="${p.id}">${"\u00a0\u00a0".repeat(depth)}${p.kind === "folder" ? "\u{1F4C1} " : ""}${esc(p.name)}</option>`).join("");
   if ([...$("statsScope").options].some(o => o.value === scope)) $("statsScope").value = scope;
 }
 const ownLists = () => state.playlists.filter(p => p.kind === "own");
 async function loadLibrary() {
   try { state.library = await api("/api/library"); } catch (e) {}
 }
+// folders: open/closed state is remembered; folder ids are negative, like the server sends them
+const openFolders = new Set((() => { try { return JSON.parse(localStorage.getItem("openFolders")) || []; } catch (e) { return []; } })());
+function folderTree(onlyFolders) {  // [[item, depth]] in sidebar order, folders first at each level
+  const out = [], kids = parent => state.playlists.filter(p => p.kind !== "all" && (p.folder ?? null) === parent && (!onlyFolders || p.kind === "folder"))
+    .sort((a, b) => (b.kind === "folder") - (a.kind === "folder") || (b.pinned - a.pinned) || a.name.localeCompare(b.name));
+  const walk = (parent, depth, seen) => kids(parent).forEach(p => {
+    out.push([p, depth]);
+    if (p.kind === "folder" && !seen.has(p.id)) walk(p.id, depth + 1, new Set([...seen, p.id]));
+  });
+  walk(null, 0, new Set());
+  return out;
+}
 function renderPlList() {
   const f = $("plFilter").value.trim().toLowerCase();
-  const list = state.playlists.filter(p => !f || p.name.toLowerCase().includes(f));
   $("plFilter").hidden = state.playlists.length < 4;
   const avg = p => `<small title="${p.rated} of ${p.count} rated">${p.average == null ? p.count + " songs" : "avg " + fmtScore(p.average)}</small>`;
-  $("plList").innerHTML = list.map(p => p.kind === "all"
-    ? `<div class="plrow allrow"><button class="nav ${state.current === p.id ? "active" : ""}" data-pl="${p.id}">
-         <span class="name">&#9733;&nbsp; ${esc(p.name)}</span>${avg(p)}</button></div>`
-    : `<div class="plrow"><button class="nav ${state.current === p.id ? "active" : ""}" data-pl="${p.id}">
-         <span class="name">${p.kind === "friend" ? `<span class="tag FRIEND">friend</span> ` : ""}${esc(p.name)}</span>${avg(p)}</button>
-       <button class="pin ${p.pinned ? "on" : ""}" data-pin="${p.id}" title="${p.pinned ? "Unpin" : "Pin to top"}" aria-label="Pin ${esc(p.name)}">&#128204;</button></div>`).join("")
-    || `<div class="sub" style="margin:0 12px">No matches.</div>`;
+  const all = state.playlists.find(p => p.kind === "all");
+  let rows = f ? state.playlists.filter(p => p.kind !== "all" && p.name.toLowerCase().includes(f)).map(p => [p, 0]) : folderTree();
+  if (!f) {  // hide what's inside closed folders
+    const hidden = new Set();
+    rows = rows.filter(([p]) => {
+      if (p.folder != null && (hidden.has(p.folder) || !openFolders.has(p.folder))) { hidden.add(p.id); return false; }
+      return true;
+    });
+  }
+  const pad = d => d ? ` style="padding-left:${d * 14}px"` : "";
+  $("plList").innerHTML = (all && !f ? `<div class="plrow allrow"><button class="nav ${state.current === all.id ? "active" : ""}" data-pl="${all.id}">
+         <span class="name">&#9733;&nbsp; ${esc(all.name)}</span>${avg(all)}</button></div>` : "")
+    + rows.map(([p, d]) => p.kind === "folder"
+      ? `<div class="plrow folderrow"${pad(d)}><button class="fold" data-fold="${p.id}" aria-label="Open or close ${esc(p.name)}">${openFolders.has(p.id) ? "&#9662;" : "&#9656;"}</button>
+           <button class="nav ${state.current === p.id ? "active" : ""}" data-pl="${p.id}"><span class="name">&#128193; ${esc(p.name)}</span>${avg(p)}</button></div>`
+      : `<div class="plrow"${pad(d)}><button class="nav ${state.current === p.id ? "active" : ""}" data-pl="${p.id}">
+           <span class="name">${p.kind === "friend" ? `<span class="tag FRIEND">friend</span> ` : ""}${esc(p.name)}</span>${avg(p)}</button>
+         <button class="pin ${p.pinned ? "on" : ""}" data-pin="${p.id}" title="${p.pinned ? "Unpin" : "Pin to top"}" aria-label="Pin ${esc(p.name)}">&#128204;</button></div>`).join("")
+    || (f ? `<div class="sub" style="margin:0 12px">No matches.</div>` : "");
 }
+function reveal(id) {  // open the folders something sits in, so it's visible in the sidebar
+  for (let p = state.playlists.find(x => x.id === id), n = 0; p && p.folder != null && n < 50; p = state.playlists.find(x => x.id === p.folder), n++)
+    if (!openFolders.has(p.folder)) toggleFolder(p.folder, true);
+}
+function toggleFolder(id, open = !openFolders.has(id)) {
+  open ? openFolders.add(id) : openFolders.delete(id);
+  try { localStorage.setItem("openFolders", JSON.stringify([...openFolders])); } catch (e) {}
+  renderPlList();
+}
+async function newFolder(parent = null) {
+  const name = prompt("Folder name:"); if (!name || !name.trim()) return null;
+  try {
+    const f = await api("/api/folders", {method: "POST", body: {name, parent}});
+    if (parent != null) openFolders.add(parent);
+    await loadPlaylists(); return f.id;
+  } catch (e) { toast(e.message); return null; }
+}
+function moveTo() {  // where should this playlist or folder live?
+  const me = state.playlists.find(p => p.id === state.current); if (!me) return;
+  const inside = new Set([me.id]);  // a folder can't go into itself or anything inside it
+  folderTree(true).forEach(([p]) => { if (inside.has(p.folder)) inside.add(p.id); });
+  const choices = folderTree(true).filter(([p]) => !inside.has(p.id));
+  $("moveList").innerHTML = `<button class="pickitem ${me.folder == null ? "on" : ""}" data-to="">Top level (no folder)</button>`
+    + choices.map(([p, d]) => `<button class="pickitem ${me.folder === p.id ? "on" : ""}" data-to="${p.id}" style="padding-left:${12 + d * 16}px">&#128193; ${esc(p.name)}</button>`).join("");
+  $("moveTitle").textContent = `Move "${me.name}"`;
+  $("moveDlg").showModal();
+}
+$("moveList").onclick = async e => {
+  const b = e.target.closest("[data-to]"); if (!b) return;
+  const to = b.dataset.to === "" ? null : +b.dataset.to;
+  try { await api("/api/playlists/" + state.current, {method: "PATCH", body: {folder: to}}); } catch (err) { return toast(err.message); }
+  $("moveDlg").close(); if (to != null) openFolders.add(to);
+  await loadPlaylists(); refreshPlaylist();
+};
+$("moveNew").onclick = async () => {
+  const id = await newFolder(); if (id == null) return;
+  try { await api("/api/playlists/" + state.current, {method: "PATCH", body: {folder: id}}); } catch (err) { return toast(err.message); }
+  $("moveDlg").close(); openFolders.add(id); await loadPlaylists(); refreshPlaylist();
+};
 $("plFilter").addEventListener("input", renderPlList);
 async function newPlaylist(suggest = "") {
   const name = prompt("Playlist name:", suggest);
   if (!name || !name.trim()) return null;
-  try { const p = await api("/api/playlists", {method: "POST", body: {name}}); await loadPlaylists(); return p.id; }
+  try { const p = await api("/api/playlists", {method: "POST", body: {name}}); await loadPlaylists(); reveal(p.id); return p.id; }
   catch (e) { toast(e.message); return null; }
 }
 async function togglePin(id) {
@@ -236,9 +300,13 @@ $("navSearch").onclick = () => { show("search"); renderSearch(); };
 $("navStats").onclick = () => { show("stats"); loadStats(); };
 $("newPl").onclick = async () => { const id = await newPlaylist(); if (id) openPlaylist(id); };
 $("plList").onclick = e => {
-  const pin = e.target.closest("[data-pin]"), b = e.target.closest("[data-pl]");
-  if (pin) togglePin(+pin.dataset.pin); else if (b) openPlaylist(+b.dataset.pl);
+  const pin = e.target.closest("[data-pin]"), b = e.target.closest("[data-pl]"), fold = e.target.closest("[data-fold]");
+  if (fold) toggleFolder(+fold.dataset.fold);
+  else if (pin) togglePin(+pin.dataset.pin);
+  else if (b) { if (+b.dataset.pl < 0 && !openFolders.has(+b.dataset.pl)) toggleFolder(+b.dataset.pl, true); openPlaylist(+b.dataset.pl); }
 };
+$("newFolder").onclick = async () => { const id = await newFolder(); if (id != null) openPlaylist(id); };
+$("plMove").onclick = moveTo;
 $("importPl").onclick = () => { show("import"); if (!IMP.rows) resetImport(); };
 $("impPick").onclick = () => $("importFile").click();
 $("importFile").onchange = async e => {
@@ -261,7 +329,7 @@ async function importPlaylistFile(file) {
 /* ---------- spreadsheet import ---------- */
 const IMP = {name: "", sheets: [], sheet: 0, rows: null, items: [], filter: "all"};
 const ROLE_NAMES = {ignore: "Ignore", anime: "Anime", song: "Song name", artist: "Artist", songartist: "Song + artist",
-                    score: "Score", season: "Season", type: "Song type (OP/ED)"};
+                    score: "Score", season: "Season", type: "Song type (OP/ED)", link: "YouTube link"};
 function resetImport() {
   IMP.rows = null; IMP.items = [];
   $("impStart").hidden = false; $("impMap").hidden = true; $("impReview").hidden = true; $("impPaste").value = "";
@@ -271,8 +339,8 @@ $("impRestart").onclick = resetImport;
 $("impRestart2").onclick = resetImport;
 $("impLinkGo").onclick = () => {
   const url = $("impLink").value.trim();
-  if (!url) return toast("Paste a Google Sheets link first.");
-  readSheet({url}, "Opening the sheet…");
+  if (!url) return toast("Paste a Google Sheets or YouTube Music playlist link first.");
+  readSheet({url}, /youtu\.?be/i.test(url) ? "Reading the playlist…" : "Opening the sheet…");
 };
 $("impLink").addEventListener("keydown", e => { if (e.key === "Enter") $("impLinkGo").click(); });
 $("impPasteGo").onclick = () => {
@@ -319,7 +387,7 @@ $("impPreview").addEventListener("change", e => {
   const col = e.target.dataset.col; if (col == null) return;
   const role = e.target.value;
   // one anime / score / song column at a time
-  if (["anime", "score", "song", "songartist", "artist", "season", "type"].includes(role))
+  if (["anime", "score", "song", "songartist", "artist", "season", "type", "link"].includes(role))
     IMP.roles = IMP.roles.map((r, i) => r === role && i !== +col ? "ignore" : r);
   if (role === "songartist") IMP.roles = IMP.roles.map((r, i) => (r === "song" || r === "artist") && i !== +col ? "ignore" : r);
   if (role === "song" || role === "artist") IMP.roles = IMP.roles.map(r => r === "songartist" ? "ignore" : r);
@@ -374,7 +442,8 @@ function drawReview() {
     } else if (it.status === "unchecked") {
       ours = `<span class="tag UNCHECKED">Couldn't check</span><div class="impact">${find}</div>`;
     } else if (it.song) {
-      ours = `<span class="tag MISS">Not found</span> <span class="sub">adds as a custom song</span><div class="impact">${find}</div>`;
+      ours = `<span class="tag MISS">Not found</span> <span class="sub">adds as a custom song${it.link ? " with its YouTube link" : ""}</span>
+        <div class="impact">${it.link ? `<button class="btn sm" data-yt="${i}">&#9654; Play</button>` : ""}${find}</div>`;
     } else ours = `<span class="sub">Skipped</span>`;
     return `<tr class="${it.on ? "" : "off"}"><td><input type="checkbox" class="chkbox" data-imp="${i}" ${it.on ? "checked" : ""} ${it.song ? "" : "disabled"} aria-label="Include"></td>
       <td class="sub">${it.row}</td><td>${theirs}</td><td class="nowrap">${fmtRaw(it)}</td><td>${ours}</td></tr>`;
@@ -387,7 +456,8 @@ $("impRows").addEventListener("change", e => {
   IMP.items[+i].on = e.target.checked; drawReview();
 });
 $("impRows").addEventListener("click", e => {
-  const f = e.target.closest("[data-find]"), u = e.target.closest("[data-unpick]");
+  const f = e.target.closest("[data-find]"), u = e.target.closest("[data-unpick]"), y = e.target.closest("[data-yt]");
+  if (y) { const it = IMP.items[+y.dataset.yt]; playQueue([{key: "yt-" + it.row, songName: it.song, artist: it.artist, anime: it.anime, link: it.link, custom: true}], 0); }
   if (f) openFind(+f.dataset.find);
   if (u) { const it = IMP.items[+u.dataset.unpick]; Object.assign(it, it.before || {match: null, confidence: null, status: "notfound"}); drawReview(); }
 });
@@ -530,7 +600,7 @@ $("findCustom").onclick = () => {
 $("impGo").onclick = async () => {
   const items = IMP.items.filter(it => it.on && it.song).map(it => it.match
     ? {song: it.match, score: it.score}
-    : {custom: {name: it.song, artist: it.artist, anime: it.anime}, score: it.score});
+    : {custom: {name: it.song, artist: it.artist, anime: it.anime, link: it.link || ""}, score: it.score});
   if (!items.length) return toast("Nothing ticked to import.");
   const into = $("impInto").value;
   try {
@@ -776,13 +846,16 @@ async function openPlaylist(id, keepFilters) {
   [...P.selected].forEach(k => keys.has(k) || P.selected.delete(k));
   $("plName").textContent = d.name;
   $("plKind").innerHTML = d.kind === "all" ? "Every song in your playlists, plus anything you've rated. It fills itself in."
+    : d.kind === "folder" ? "Every song in the playlists inside this folder, ranked together. It fills itself in."
     : d.kind === "friend" ? "A friend's playlist: their scores and notes, with yours alongside. Rating here only changes your score." : "";
   // what you can do depends on the kind of list
   ["plPin", "plRename", "plDelete"].forEach(b => $(b).hidden = d.kind === "all");
+  $("plPin").hidden = d.kind === "all" || d.kind === "folder"; $("plMove").hidden = d.kind === "all";
   $("addCustom").hidden = d.kind !== "own";
   if ($("viewPlaylist").hidden) show("playlist");
   state.current = id;
-  await loadPlaylists(); facets(P); renderPlaylist();
+  await loadPlaylists();
+  reveal(id); facets(P); renderPlaylist();
 }
 const refreshPlaylist = () => openPlaylist(state.current, true);
 function renderPlaylist() {
@@ -933,7 +1006,8 @@ $("plRename").onclick = async () => {
   catch (e) { toast(e.message); }
 };
 $("plDelete").onclick = async () => {
-  if (!confirm(`Delete "${$("plName").textContent}"? Your scores stay (they're in All songs). Downloaded files stay too.`)) return;
+  if (!confirm(state.current < 0 ? `Delete the folder "${$("plName").textContent}"? Only the folder goes: what's inside moves up a level.`
+    : `Delete "${$("plName").textContent}"? Your scores stay (they're in All songs). Downloaded files stay too.`)) return;
   try { await api("/api/playlists/" + state.current, {method: "DELETE"}); } catch (e) { return toast(e.message); }
   show("search"); loadPlaylists(); loadLibrary(); renderSearch();
 };
@@ -981,12 +1055,13 @@ $("plRate").onclick = () => {
     list = [...P.shown];
   }
   R.list = list; R.i = 0;
-  audio.pause();
+  media.pause();
   $("rateDlg").showModal(); renderRate();
 };
 const rMedia = () => $("rMedia");
 function stopRateMedia() {
   const m = rMedia(); if (!m) return;
+  if (m.tagName === "IFRAME") return m.remove();
   m.pause(); m.removeAttribute("src"); m.load();
 }
 function renderRate() {
@@ -998,8 +1073,10 @@ function renderRate() {
       <div class="row" style="justify-content:flex-end"><button class="btn primary" data-close>Close</button></div>`;
     return;
   }
-  const video = s.hq || s.mq, art = s.cover || s.coverSmall, mine = mineOf(s);
-  const media = video
+  const video = s.hq || s.mq, art = s.cover || s.coverSmall, mine = mineOf(s), yt = !video && !s.audio && ytId(s);
+  const media = yt ? `<iframe id="rMedia" class="rvideo" src="https://www.youtube.com/embed/${yt}?autoplay=1&rel=0&playsinline=1"
+      allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>`
+    : video
     ? `<video id="rMedia" class="rvideo" controls autoplay playsinline preload="auto" src="${esc(video)}" ${art ? `poster="${esc(art)}"` : ""}></video>`
     : `<div class="rart ${art ? "" : "none"}" ${art ? `style="background-image:url('${esc(art)}')"` : ""}></div>`
       + (s.audio ? `<audio id="rMedia" class="raudio" controls autoplay preload="auto" src="${esc(s.audio)}"></audio>` : `<div class="sub">No audio for this one.</div>`);
@@ -1028,7 +1105,7 @@ function renderRate() {
       </div>
     </div>`;
   const m = rMedia();
-  if (m) {
+  if (m && m.tagName !== "IFRAME") {
     m.volume = audio.volume; m.muted = audio.muted;
     m.play().catch(() => {});  // some browsers want a click first; the controls are right there
   }
@@ -1119,8 +1196,8 @@ function phoneCount() {
 $("phonePl").onclick = () => {
   const lists = state.playlists.filter(p => p.kind !== "friend");
   $("phoneFrom").innerHTML = lists.map(p => `<label class="pickitem">
-      <input type="checkbox" class="chkbox" value="${p.id}" ${p.kind !== "all" ? "checked" : ""}>
-      <span class="pname">${p.kind === "all" ? "&#9733; " : ""}${esc(p.name)}</span><span class="pcount">${p.count}</span></label>`).join("");
+      <input type="checkbox" class="chkbox" value="${p.id}" ${p.kind === "own" ? "checked" : ""}>
+      <span class="pname">${p.kind === "all" ? "&#9733; " : p.kind === "folder" ? "&#128193; " : ""}${esc(p.name)}</span><span class="pcount">${p.count}</span></label>`).join("");
   $("phoneErr").textContent = ""; phoneCount(); $("phoneDlg").showModal();
 };
 $("phoneFrom").addEventListener("change", phoneCount);
@@ -1218,7 +1295,7 @@ async function loadStats() {
   let d;
   try { d = await api("/api/stats" + ($("statsScope").value ? "?playlist=" + $("statsScope").value : "")); }
   catch (e) { $("statCards").innerHTML = `<div class="status err">${esc(e.message)}</div>`; return; }
-  renderStats(d.entries, d.playlists, d.playlistAverages || []);
+  renderStats(d.entries, d.playlists, d.playlistAverages || [], d.folder);
 }
 function median(xs) { const a = [...xs].sort((x, y) => x - y), m = a.length >> 1; return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2; }
 function groupAvg(songs, keysOf, min = 1) {
@@ -1247,7 +1324,7 @@ function songList(list, from = 1, dir = 1) {
       <span class="badge">${fmtScore(s.score)}</span></div>`).join("")}</div>`;
 }
 const card = (title, sub, body) => `<div class="card"><h3>${title}</h3><div class="sub">${sub}</div>${body}</div>`;
-function renderStats(entries, playlistCount, playlistAverages) {
+function renderStats(entries, playlistCount, playlistAverages, folder) {
   const scope = $("statsScope").value;
   const seen = new Set(), songs = entries.filter(e => e.score != null && !seen.has(e.key) && seen.add(e.key));
   const unrated = new Set(entries.filter(e => e.score == null).map(e => e.key)).size;
@@ -1283,7 +1360,7 @@ function renderStats(entries, playlistCount, playlistAverages) {
   const seasons = groupAvg(songs, s => [(s.vintage || "").split(" ")[0]]).filter(r => r.label in SEASON_NUM)
     .sort((a, b) => SEASON_NUM[a.label] - SEASON_NUM[b.label]);
   const formats = sortAvg(groupAvg(songs, s => [s.animeType]));
-  const lists = scope ? [] : sortAvg(playlistAverages.map(p => ({label: p.name, value: p.average, count: p.count})));
+  const lists = scope && !folder ? [] : sortAvg(playlistAverages.map(p => ({label: p.name, value: p.average, count: p.count})));
   const ranked = [...songs].sort((a, b) => b.score - a.score || a.songName.localeCompare(b.songName));
   const gems = songs.filter(s => s.difficulty != null && s.difficulty < 35 && s.score >= 8)
     .sort((a, b) => b.score - a.score || a.difficulty - b.difficulty).slice(0, 8);
@@ -1302,7 +1379,8 @@ function renderStats(entries, playlistCount, playlistAverages) {
     card("By season", "Winter, spring, summer or fall", bars(seasons)),
     card("By format", "TV, movies, OVAs…", bars(formats)),
     card("Composers", "Highest average, two or more rated songs", bars(composers, {empty: "Composer info only comes with AniSongDB songs."})),
-    scope ? "" : card("Playlists", "Average score per playlist", bars(lists)),
+    folder ? (lists.length ? card("Inside this folder", "Average score for each playlist and folder in it", bars(lists)) : "")
+      : scope ? "" : card("Playlists", "Average score per playlist", bars(lists)),
     gems.length ? card("Obscure favourites", "Songs you rate 8+ that under 35% of AMQ players guess", songList(gems)) : "",
   ].join("");
 }
@@ -1312,9 +1390,37 @@ const audio = $("audio"), seek = $("seek"), vol = $("vol");
 const ICON = {play: '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>', pause: '<svg viewBox="0 0 24 24"><path d="M6 5h4v14H6zm8 0h4v14h-4z"/></svg>'};
 const fmtT = n => { n = Math.max(0, Math.floor(n || 0)); return Math.floor(n / 60) + ":" + String(n % 60).padStart(2, "0"); };
 const fill = (el, frac) => el.style.setProperty("--p", Math.max(0, Math.min(1, frac)) * 100 + "%");
-const duration = () => isFinite(audio.duration) && audio.duration > 0 ? audio.duration : (state.queue[state.qi]?.length || 0);
+const duration = () => YTP.on ? YTP.player?.getDuration?.() || 0
+  : isFinite(audio.duration) && audio.duration > 0 ? audio.duration : (state.queue[state.qi]?.length || 0);
 let seeking = false;
-function setIcon() { const on = !audio.paused && !audio.ended; $("playBtn").innerHTML = on ? ICON.pause : ICON.play; $("playBtn").setAttribute("aria-label", on ? "Pause" : "Play"); }
+const YTP = {player: null, ready: null, on: false, hidden: false, timer: 0};
+function ytReady() {  // YouTube's player script, loaded the first time a YouTube-only song plays
+  if (YTP.ready) return YTP.ready;
+  return YTP.ready = new Promise((ok, fail) => {
+    window.onYouTubeIframeAPIReady = ok;
+    const sc = document.createElement("script"); sc.src = "https://www.youtube.com/iframe_api";
+    sc.onerror = () => { YTP.ready = null; fail(new Error("offline")); }; document.head.appendChild(sc);
+  }).then(() => new Promise(ok => {
+    YTP.player = new YT.Player("ytFrame", {width: "100%", height: "100%",
+      playerVars: {autoplay: 1, rel: 0, playsinline: 1, origin: location.origin},
+      events: {onReady: ok, onStateChange: e => { setIcon(); if (e.data === 0) ended(); }, onError: e => ytFailed(e.data)}});
+  }));
+}
+function ytFailed(code) {
+  const s = state.queue[state.qi], id = ytId(s);
+  $("videoNone").innerHTML = code === 101 || code === 150 || code === 153
+    ? `This video can only play on YouTube. <a href="https://www.youtube.com/watch?v=${id}" target="_blank" rel="noopener">Open it there &#8599;</a>`
+    : `YouTube couldn't play this one. <a href="https://www.youtube.com/watch?v=${id}" target="_blank" rel="noopener">Open on YouTube &#8599;</a>`;
+  $("videoBox").classList.add("novideo");
+}
+const media = {  // whichever is playing: the normal player or YouTube's
+  get paused() { return YTP.on ? ![1, 3].includes(YTP.player?.getPlayerState?.()) : audio.paused || audio.ended; },
+  play() { YTP.on ? YTP.player?.playVideo?.() : audio.play().catch(() => {}); },
+  pause() { YTP.on ? YTP.player?.pauseVideo?.() : audio.pause(); },
+  get time() { return YTP.on ? YTP.player?.getCurrentTime?.() || 0 : audio.currentTime; },
+  set time(t) { YTP.on ? YTP.player?.seekTo?.(t, true) : audio.currentTime = t; },
+};
+function setIcon() { const on = !media.paused; $("playBtn").innerHTML = on ? ICON.pause : ICON.play; $("playBtn").setAttribute("aria-label", on ? "Pause" : "Play"); }
 function playQueue(list, i) { state.queue = list.filter(srcOf); state.qi = state.queue.indexOf(list[i]); playCurrent(); }
 function markPlaying() {
   const key = state.queue[state.qi]?.key;
@@ -1324,7 +1430,17 @@ const videoOf = s => s.mq || s.hq;
 const playSrc = s => state.video ? (videoOf(s) || s.audio) : srcOf(s);
 function playCurrent() {
   const s = state.queue[state.qi]; if (!s) return;
-  audio.src = playSrc(s); audio.play().catch(() => {});
+  const src = playSrc(s), yt = src.startsWith("yt:");
+  clearInterval(YTP.timer);
+  if (YTP.on && !yt) YTP.player?.stopVideo?.();
+  YTP.on = yt; YTP.hidden = false;
+  $("videoNone").textContent = "No video for this one";
+  if (yt) {
+    audio.pause(); audio.removeAttribute("src"); audio.load();
+    ytReady().then(() => { if (!YTP.on) return; YTP.player.loadVideoById(src.slice(3)); YTP.player.setVolume(audio.muted ? 0 : audio.volume * 100); })
+      .catch(() => { toast("Couldn't reach YouTube - check your internet."); });
+    YTP.timer = setInterval(tick, 500);
+  } else { audio.src = src; audio.play().catch(() => {}); }
   showVideoFor(s);
   $("npSong").textContent = s.songName; $("npSub").textContent = [s.artist, s.anime, shortType(s.songType)].filter(Boolean).join(" · ");
   $("npCover").className = "cover" + (s.coverSmall ? "" : " none");
@@ -1339,12 +1455,13 @@ function togglePlay() {
     const i = list.findIndex(srcOf);
     return i < 0 ? toast("Search for something or open a playlist first.") : playQueue(list, i);
   }
-  audio.paused ? audio.play().catch(() => {}) : audio.pause();
+  media.paused ? media.play() : media.pause();
 }
 // video: the player is a <video> element, it just stays hidden in audio-only mode
 function showVideoFor(s) {
-  $("videoBox").hidden = !state.video;
-  $("videoBox").classList.toggle("novideo", !!s && !videoOf(s));
+  $("videoBox").hidden = YTP.on ? YTP.hidden : !state.video;
+  $("videoBox").classList.toggle("yt", YTP.on);
+  $("videoBox").classList.toggle("novideo", !!s && !YTP.on && !videoOf(s));
   $("videoTitle").textContent = s ? `${s.songName} · ${s.anime}` : "";
 }
 function setVideo(on) {
@@ -1354,7 +1471,7 @@ function setVideo(on) {
   $("videoBtn").title = on ? "Hide the video" : "Show the video";
   const s = state.queue[state.qi];
   showVideoFor(s);
-  if (!s || !audio.getAttribute("src")) return;
+  if (!s || YTP.on || !audio.getAttribute("src")) return;
   const want = playSrc(s);
   if (audio.src === new URL(want, location.href).href) return;
   const t = audio.currentTime, playing = !audio.paused;
@@ -1363,24 +1480,26 @@ function setVideo(on) {
   audio.load();
 }
 $("videoBtn").onclick = () => setVideo(!state.video);
-$("videoClose").onclick = () => setVideo(false);
+$("videoClose").onclick = () => { if (YTP.on) { YTP.hidden = true; $("videoBox").hidden = true; } else setVideo(false); };
 $("videoBig").onclick = () => $("videoBox").classList.toggle("big");
 $("playBtn").onclick = togglePlay; $("next").onclick = () => step(1); $("prev").onclick = () => step(-1);
 audio.onplay = audio.onpause = () => { setIcon(); if ($("findDlg").open) markPreview(); };
-audio.ontimeupdate = audio.ondurationchange = () => {
-  const d = duration();
-  if (!seeking) { seek.value = d ? audio.currentTime / d * 1000 : 0; fill(seek, d ? audio.currentTime / d : 0); }
-  $("tCur").textContent = fmtT(audio.currentTime); $("tDur").textContent = fmtT(d);
-};
+function tick() {
+  const d = duration(), t = media.time;
+  if (!seeking) { seek.value = d ? t / d * 1000 : 0; fill(seek, d ? t / d : 0); }
+  $("tCur").textContent = fmtT(t); $("tDur").textContent = fmtT(d);
+}
+audio.ontimeupdate = audio.ondurationchange = tick;
 seek.oninput = () => { seeking = true; fill(seek, seek.value / 1000); $("tCur").textContent = fmtT(seek.value / 1000 * duration()); };
-seek.onchange = () => { const d = duration(); if (d) audio.currentTime = seek.value / 1000 * d; seeking = false; };
+seek.onchange = () => { const d = duration(); if (d) media.time = seek.value / 1000 * d; seeking = false; };
 function setVolume(v) {
-  audio.volume = v; audio.muted = false; vol.value = v * 100; fill(vol, v);
+  audio.volume = v; audio.muted = false; vol.value = v * 100; fill(vol, v); YTP.player?.setVolume?.(v * 100);
   try { localStorage.setItem("volume", v); } catch (e) {}
 }
 vol.oninput = () => setVolume(vol.value / 100);
-$("mute").onclick = () => { audio.muted = !audio.muted; fill(vol, audio.muted ? 0 : audio.volume); };
-audio.onended = () => { setIcon(); if (!$("rateDlg").open && state.qi < state.queue.length - 1) step(1); };
+$("mute").onclick = () => { audio.muted = !audio.muted; fill(vol, audio.muted ? 0 : audio.volume); YTP.player?.setVolume?.(audio.muted ? 0 : audio.volume * 100); };
+function ended() { setIcon(); if (!$("rateDlg").open && state.qi < state.queue.length - 1) step(1); }
+audio.onended = ended;
 audio.onerror = () => { if (audio.getAttribute("src")) toast("That file won't play - the host may be down."); };
 addEventListener("keydown", e => {
   // space is play/pause everywhere except while typing

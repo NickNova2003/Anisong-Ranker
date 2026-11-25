@@ -471,3 +471,57 @@ def covered(song, existing):
                     and similar(other["songName"], song["songName"]) >= 0.8:
                 return True
     return False
+
+
+# ---------------------------------------------------------- YouTube Music
+YT_LIST = re.compile(r"[?&]list=([\w-]+)")
+YT_VIDEO = re.compile(r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|embed/|live/)|youtu\.be/)([\w-]{11})")
+
+
+def youtube_link(video_id):
+    return f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+
+
+def _ytmusic():
+    try:
+        from ytmusicapi import YTMusic
+    except ImportError:
+        raise ValueError("YouTube Music import needs Python 3.10 or newer. Install a newer Python from python.org, "
+                         "then start the app with run.bat again.")
+    return YTMusic(language="en")
+
+
+def ytm_playlist(link):
+    """(title, tracks) for a public or unlisted YouTube / YouTube Music playlist."""
+    m = YT_LIST.search(link or "")
+    if not m or not re.search(r"youtu\.?be", link):
+        raise ValueError("That doesn't look like a YouTube Music playlist link - open the playlist, tap Share and copy the link.")
+    pid = m.group(1)
+    if pid in ("LM", "LL", "WL") or pid.startswith("RD"):
+        raise ValueError("That's your Liked music, Watch later or an auto mix, which YouTube keeps private. "
+                         "Copy the songs into a normal playlist set to Public or Unlisted, then use that link.")
+    try:
+        data = _ytmusic().get_playlist(pid, limit=None)
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("YouTube Music wouldn't share that playlist. Make sure it's set to Public or Unlisted, then try again.")
+    tracks = [{"title": t.get("title") or "", "artists": [a.get("name") for a in t.get("artists") or [] if a.get("name")],
+               "album": (t.get("album") or {}).get("name") or "", "videoId": t["videoId"], "kind": t.get("videoType") or ""}
+              for t in data.get("tracks") or [] if t.get("videoId") and t.get("title")]
+    if not tracks:
+        raise ValueError("That playlist is empty, or YouTube didn't show its songs.")
+    return data.get("title") or "YouTube Music playlist", tracks
+
+
+def ytm_find(query):
+    """YouTube link for the closest song (or video) to "title artist". None if nothing comes up."""
+    try:
+        yt = _ytmusic()
+        for kind in ("songs", "videos"):
+            for r in yt.search(query, filter=kind, limit=3):
+                if r.get("videoId"):
+                    return youtube_link(r["videoId"])
+    except Exception:
+        return None
+    return None

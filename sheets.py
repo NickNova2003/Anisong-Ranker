@@ -5,7 +5,7 @@ import re
 
 from sources import parse_theme_line, similar, simplify, type_code
 
-ROLES = ("ignore", "anime", "song", "artist", "songartist", "score", "season", "type")
+ROLES = ("ignore", "anime", "song", "artist", "songartist", "score", "season", "type", "link")
 HEADER_WORDS = {
     "anime": ("anime", "show", "series", "anime name", "show name"),
     "song": ("song", "track", "song name", "title", "song title", "opening", "ending", "theme"),
@@ -13,6 +13,7 @@ HEADER_WORDS = {
     "score": ("score", "rating", "rate", "points", "grade", "mark", "/10", "out of"),
     "season": ("season", "cour", "vintage"),
     "type": ("type", "kind", "op/ed", "op / ed"),
+    "link": ("link", "url", "youtube", "youtube link", "yt", "video"),
 }
 # "Grand Blue Ending 4", "Naruto OP3", "Kingdom ED 7", "Op.2", "Opening Theme 2", "#4"
 SLOT = re.compile(r"(?:^|\s|\b)(op|ed|opening|ending|insert(?: song)?)(?:\s*theme)?\s*[#.]?\s*(\d+)?\s*$", re.I)
@@ -136,6 +137,9 @@ def guess(rows, filename=""):
         combined = sum(1 for v in values if parse_theme_line(v) and parse_theme_line(v)[2]) / len(values)
         if roles[i] in ("song", "ignore") and combined >= 0.6 and "songartist" not in roles:
             roles[i] = "songartist"
+            continue
+        if roles[i] == "ignore" and "link" not in roles and sum(v.lower().startswith("http") for v in values) / len(values) >= 0.6:
+            roles[i] = "link"
             continue
         nums = [number(v) for v in values]
         if all(n is not None for n in nums):
@@ -282,8 +286,10 @@ def build_items(rows, mapping):
             kind = "OP" if t.startswith("op") else "ED" if t.startswith(("ed", "end")) else "IN" if t.startswith("in") else kind
         if not anime and not song:
             continue  # blank or a totals row
+        link = get("link") if re.match(r"https?://", get("link"), re.I) else ""
         items.append({"row": n + 1, "anime": anime, "animeClean": clean_anime(anime), "song": song, "artist": artist,
-                      "rawScore": get("score"), "score": score, "season": row_season, "type": kind, "slot": slot})
+                      "rawScore": get("score"), "score": score, "season": row_season, "type": kind, "slot": slot,
+                      "link": link})
     return items
 
 
@@ -378,3 +384,63 @@ def google_export_url(link):
     if m.group(1):
         return f"https://docs.google.com/spreadsheets/d/e/{m.group(2)}/pub?output=xlsx"
     return f"https://docs.google.com/spreadsheets/d/{m.group(2)}/export?format=xlsx"
+
+
+# ---------------------------------------------------- YouTube video titles
+NOISE = re.compile(r"""\s*[(\[【]\s*(?:[^)\]】]*\b(?:tv[\s-]*size|tv\s*ver(?:sion)?|official|music\s*video|mv|m/v|lyrics?|lyric\s*video|audio|full|
+                       full\s*ver(?:sion)?|creditless|nc(?:op|ed)|hd|hq|4k|1080p|remaster(?:ed)?|visuali[sz]er|anime\s*edit)\b[^)\]】]*)[)\]】]""",
+                   re.I | re.X)
+THEME = re.compile(r"""(?:\b(?:from|tv\s*anime|anime)\s*)?["“「『]?([^"”」』()\[\]【】]{2,80}?)["”」』]?\s*
+                       (?:\(|\b)(?:opening|ending|op|ed|insert\s*song|theme\s*song)\s*(?:theme)?\s*(\d*)\b""", re.I | re.X)
+CHANNEL = re.compile(r"\s*(?:-\s*topic|vevo|official(?:\s*(?:channel|youtube))?|channel|music)\s*$", re.I)
+
+
+def video_row(title, artists, album=""):
+    """A YouTube title like 'Vaundy - Hashire SAKAMOTO (TV Size) [SAKAMOTO DAYS Opening]' as
+    (song, artist, anime hint, OP/ED/IN or "")."""
+    artist = ", ".join(CHANNEL.sub("", a).strip() for a in artists if a) if artists else ""
+    hint = kind = ""
+    title = re.sub(r"\s+(?:official\s+)?(?:music\s+video|mv|lyrics?(?:\s+video)?|audio|video)\s*$", "", title, flags=re.I)
+    by = re.search(r'["“]([^"”]+)["”]\s*by\s+([^()\[\]【】]+)', title)
+    if by:  # fan uploads: 'Mashle Season 2 - Opening Full "Bling-Bang-Bang-Born" by Creepy Nuts'
+        before = title[:by.start()]
+        m = THEME.search(before)
+        hint = (m.group(1) if m else re.sub(r"[-|:]\s*$", "", before)).strip(" -|:")
+        return by.group(1).strip(), by.group(2).strip(), hint, "OP" if re.search(r"\bop|opening", before, re.I) else \
+            "ED" if re.search(r"\bed\b|ending", before, re.I) else ""
+    quoted = re.findall(r"[「『]([^」』]+)[」』]", title)
+    if quoted:  # 'YOASOBI「アイドル」' or 'TVアニメ「Show」OPテーマ「Song」': the last one is the song
+        if len(quoted) > 1:
+            hint = quoted[0]
+        kind = title
+        return quoted[-1].strip(), artist, hint, "OP" if re.search(r"op|オープニング", kind, re.I) else \
+            "ED" if re.search(r"ed|エンディング", kind, re.I) and len(quoted) > 1 else ""
+    for part in re.findall(r"[(\[【]([^)\]】]+)[)\]】]", title):  # the anime usually sits in brackets
+        m = THEME.search(part)
+        if m and m.group(1).strip():
+            hint, kind = m.group(1).strip(" -:"), m.group(0)
+            title = title.replace(part, " ")
+            break
+    song = NOISE.sub(" ", title)
+    song = re.sub(r"[(\[【]\s*[)\]】]", " ", song)
+    song = re.sub(r"\s*[(\[]\s*(?:feat\.?|ft\.?|with)\s[^)\]]*[)\]]", " ", song, flags=re.I)  # (feat. X)
+    if " - " in song:  # "Artist - Song" or "Song - Artist"
+        left, right = (x.strip() for x in song.split(" - ", 1))
+        if artist and similar_text(left, artist) >= 0.6:
+            song = right
+        elif artist and similar_text(right, artist) >= 0.6:
+            song = left
+        elif not artist:
+            artist, song = left, right
+    song = re.sub(r"\s+", " ", song).strip(" -|/").strip("「」『』\"“”")
+    if not hint and album and album.lower() not in (song.lower(), title.lower()):
+        hint = ""  # albums on YouTube Music are usually the single, not the anime
+    kind = "OP" if re.search(r"\b(?:op|opening)", kind, re.I) else "ED" if re.search(r"\b(?:ed|ending)", kind, re.I) \
+        else "IN" if re.search(r"insert", kind, re.I) else ""
+    return song, artist, hint, kind
+
+
+def similar_text(a, b):
+    from difflib import SequenceMatcher
+    a, b = simplify(a), simplify(b)
+    return SequenceMatcher(None, a, b).ratio() if a and b else 0.0

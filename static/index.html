@@ -17,7 +17,7 @@
     <input type="search" id="plFilter" placeholder="Search playlists…" aria-label="Search playlists">
     <div id="plList"></div>
     <div class="side-actions">
-      <button class="btn wide" id="newPl">+ New playlist</button>
+      <div class="row" style="gap:8px"><button class="btn wide" id="newPl">+ New playlist</button><button class="btn" id="newFolder" title="New folder">+ Folder</button></div>
       <button class="btn wide" id="combinePl">&#10753; Combine playlists</button>
       <button class="btn wide" id="phonePl">&#128241; Send to phone</button>
       <button class="btn wide" id="importPl">&#8679; Import</button>
@@ -91,6 +91,7 @@
         <span class="grow"></span>
         <button class="btn sm" id="plPin"></button>
         <button class="btn sm" id="plCombine">&#10753; Combine</button>
+        <button class="btn sm" id="plMove">&#128193; Move</button>
         <button class="btn sm" id="plRename">Rename</button>
         <button class="btn sm danger" id="plDelete">Delete</button>
       </div>
@@ -128,12 +129,12 @@
           <button class="btn primary" id="impPick">&#8679; Choose a file</button>
           <span class="sub">CSV or Excel, or a playlist file a friend sent you.</span>
         </div>
-        <label class="label" for="impLink" style="display:block;margin-top:18px">Or a Google Sheets link</label>
+        <label class="label" for="impLink" style="display:block;margin-top:18px">Or a Google Sheets or YouTube Music playlist link</label>
         <div class="row">
-          <input type="text" id="impLink" class="grow" placeholder="https://docs.google.com/spreadsheets/d/…" autocomplete="off">
+          <input type="text" id="impLink" class="grow" placeholder="docs.google.com/spreadsheets/… or music.youtube.com/playlist?list=…" autocomplete="off">
           <button class="btn" id="impLinkGo">Open</button>
         </div>
-        <div class="sub" style="margin-top:6px">The sheet has to be shared as "Anyone with the link". Every tab comes in, and you pick one.</div>
+        <div class="sub" style="margin-top:6px">Sheets have to be shared as "Anyone with the link". YouTube Music playlists have to be Public or Unlisted. Songs that aren't on AniSongDB come in with their YouTube link, ready to play.</div>
         <div class="status" id="impLinkNote" style="margin-top:6px"></div>
         <label class="label" for="impPaste" style="display:block;margin-top:18px">Or paste rows</label>
         <textarea id="impPaste" rows="5" placeholder="Select the cells in Google Sheets or Excel, copy, and paste here"></textarea>
@@ -209,6 +210,16 @@
       <button class="btn primary" type="submit">Add</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="moveDlg">
+  <h3 id="moveTitle">Move</h3>
+  <div class="sub">Pick a folder. Folders can sit inside other folders.</div>
+  <div class="picklist" id="moveList" style="margin-top:12px"></div>
+  <div class="row" style="justify-content:space-between;margin-top:16px">
+    <button class="btn" type="button" id="moveNew">+ New folder</button>
+    <button class="btn" type="button" data-close>Cancel</button>
+  </div>
 </dialog>
 
 <dialog id="phoneDlg">
@@ -294,6 +305,7 @@
     <button class="ib" id="videoClose" title="Back to audio only" aria-label="Close video"><svg viewBox="0 0 24 24"><path d="m6 4.6 6 6 6-6 1.4 1.4-6 6 6 6-1.4 1.4-6-6-6 6L4.6 18l6-6-6-6z"/></svg></button>
   </div>
   <video id="audio" preload="none" playsinline></video>
+  <div id="ytWrap"><div id="ytFrame"></div></div>
   <div class="vnone" id="videoNone">No video for this one</div>
 </div>
 <div id="tip" hidden></div>
